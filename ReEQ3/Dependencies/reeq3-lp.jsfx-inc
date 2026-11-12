@@ -1,0 +1,272 @@
+desc: ReEQ3 linear phase and spectral engine
+/*
+  ReEQ3: the FFT engine behind Linear Phase processing and spectral dynamics.
+
+  Each hop (half a frame) the last LP_L input samples are windowed (periodic Hann, which sums to 1 at
+  half overlap), zero padded to LP_N = 2 LP_L and transformed, left and right packed into one complex
+  FFT. A 2x2 filter matrix multiplies every bin (Mid/Side and Left/Right bands mix the channels), and
+  the result is overlap-added back. Every filter's impulse response is designed to fit in LP_L samples,
+  so a static EQ is an exact linear convolution, while dynamic and spectral gains change from frame to
+  frame and the windows crossfade them.
+
+  The filter is linear phase: the zero-phase response the bands ask for, taken to an impulse response,
+  centred at LP_L / 2 and tapered by a Blackman window. Latency is LP_L (one frame) + LP_L / 2 (the
+  response's centre).
+
+  MIT License, (c) 2026 Eloy Platas, after ReEQ2 by Justin Johnson.
+*/
+
+@init
+
+/*
+ * Memory. JSFX's fft() needs its buffer inside one 65536-word block, so the big buffers start on such a
+ * block. Returns the first free word after the engine's memory.
+ */
+function lp_alloc(base, lmax) local(p, nmax) (
+  LP_LMAX = lmax; nmax = 2 * lmax;
+  p = ceil(base / 65536) * 65536;
+  LP_FBUF = p; p += 65536;           // the frame's spectrum (complex, LP_N)
+  LP_DBUF = p; p += 65536;           // design scratch (complex, LP_N)
+  LP_SCBUF = p; p += 65536;          // the sidechain frame's spectrum (spectral dynamics)
+  // The filter, per bin 0..LP_N/2, complex: H11 H12 H21 H22 (rows: out L/R, columns: in L/R)
+  LP_H11 = p; p += nmax + 2;
+  LP_H12 = p; p += nmax + 2;
+  LP_H21 = p; p += nmax + 2;
+  LP_H22 = p; p += nmax + 2;
+  // The zero-phase response matrix the bands ask for, per bin, real
+  LP_M11 = p; p += lmax + 1;
+  LP_M12 = p; p += lmax + 1;
+  LP_M21 = p; p += lmax + 1;
+  LP_M22 = p; p += lmax + 1;
+  // Input rings (main pair and one sidechain pair), output accumulators, windows
+  LP_INL = p; p += lmax;
+  LP_INR = p; p += lmax;
+  LP_SCL = p; p += lmax;
+  LP_SCR = p; p += lmax;
+  LP_OUTL = p; p += nmax;
+  LP_OUTR = p; p += nmax;
+  LP_WIN = p; p += lmax;
+  LP_IRWIN = p; p += lmax;
+  // The per-bin levels of the frame's detector inputs, in dB: four rows (left, right, mid, side) for the
+  // main pair, then four for the sidechain pair
+  LP_ROWL = lmax + 1;
+  LP_LV = p; p += 4 * LP_ROWL;
+  LP_SLV = p; p += 4 * LP_ROWL;
+  // A delay line for what bypasses the engine (listening), 1.5 frames long
+  LP_DLY = p; p += 2 * (lmax + lmax / 2 + 2);
+  LP_L = 0;
+  p;
+);
+
+/*
+ * The response matrix: identity
+ */
+function lp_identity() (
+  memset(LP_M11, 1, LP_NB); memset(LP_M22, 1, LP_NB);
+  memset(LP_M12, 0, LP_NB); memset(LP_M21, 0, LP_NB);
+  LP_CROSS = 0;
+);
+
+/*
+ * Design two real zero-phase responses ga, gb (per bin 0..LP_N/2) into the linear-phase filters ha, hb
+ * (complex, per bin 0..LP_N/2, with the 1/LP_N of the engine's inverse transform folded in)
+ */
+function lp_design_pair(ga, gb, ha, hb) local(k, j, b, kk, n, zr, zi, wr, wi, sc, w) (
+  b = LP_DBUF;
+  // Zero-phase spectra, mirrored: C[k] = ga[k] + i gb[k]
+  k = 0;
+  loop(LP_NB,
+    b[2 * k] = ga[k]; b[2 * k + 1] = gb[k];
+    k > 0 && k < LP_L ? (j = LP_N - k; b[2 * j] = ga[k]; b[2 * j + 1] = gb[k]);
+    k += 1;
+  );
+  fft_ipermute(b, LP_N);
+  ifft(b, LP_N);
+  // Centre the (even) responses on LP_D and taper them over LP_L samples; the rest is zero. Work on a
+  // copy of the circular result held in the second half of the scratch area of LP_SCBUF.
+  sc = 1 / (LP_N * LP_N);
+  memcpy(LP_SCBUF, b, 2 * LP_N);
+  memset(b, 0, 2 * LP_N);
+  n = 0;
+  loop(LP_L,
+    kk = n - LP_D; kk < 0 ? kk += LP_N;
+    w = LP_IRWIN[n] * sc;
+    b[2 * n] = LP_SCBUF[2 * kk] * w;
+    b[2 * n + 1] = LP_SCBUF[2 * kk + 1] * w;
+    n += 1;
+  );
+  fft(b, LP_N);
+  fft_permute(b, LP_N);
+  // Unpack the two real responses' spectra
+  k = 0;
+  loop(LP_NB,
+    j = k == 0 ? 0 : LP_N - k;
+    zr = b[2 * k]; zi = b[2 * k + 1]; wr = b[2 * j]; wi = b[2 * j + 1];
+    ha[2 * k] = (zr + wr) * 0.5; ha[2 * k + 1] = (zi - wi) * 0.5;
+    hb[2 * k] = (zi + wi) * 0.5; hb[2 * k + 1] = (wr - zr) * 0.5;
+    k += 1;
+  );
+);
+
+/*
+ * Design the whole filter from the response matrix (the cross terms only when something mixes the
+ * channels)
+ */
+function lp_design_full() (
+  lp_design_pair(LP_M11, LP_M22, LP_H11, LP_H22);
+  LP_CROSS ? lp_design_pair(LP_M12, LP_M21, LP_H12, LP_H21) : (
+    memset(LP_H12, 0, 2 * LP_NB); memset(LP_H21, 0, 2 * LP_NB);
+  );
+  LP_HCROSS = LP_CROSS;
+);
+
+/*
+ * Per-bin levels of a transformed frame (packed left + i right), in dB, into four rows from out (left,
+ * right, mid, side; LP_ROWL apart)
+ */
+function lp_levels(buf, out) local(k, j, zr, zi, wr, wi, lr, li, rr, ri, sc, o1, o2, o3) (
+  // Hann window gain 0.5, and the transform's length: a sine reads its peak level
+  sc = 16 / (LP_L * LP_L);
+  o1 = out + LP_ROWL; o2 = o1 + LP_ROWL; o3 = o2 + LP_ROWL;
+  k = 0;
+  loop(LP_NB,
+    j = k == 0 ? 0 : LP_N - k;
+    zr = buf[2 * k]; zi = buf[2 * k + 1]; wr = buf[2 * j]; wi = buf[2 * j + 1];
+    lr = (zr + wr) * 0.5; li = (zi - wi) * 0.5;
+    rr = (zi + wi) * 0.5; ri = (wr - zr) * 0.5;
+    out[k] = 10 * log10((lr * lr + li * li) * sc + 0.00000000000000000001);
+    o1[k] = 10 * log10((rr * rr + ri * ri) * sc + 0.00000000000000000001);
+    o2[k] = 10 * log10((sqr((lr + rr) * 0.5) + sqr((li + ri) * 0.5)) * sc + 0.00000000000000000001);
+    o3[k] = 10 * log10((sqr((lr - rr) * 0.5) + sqr((li - ri) * 0.5)) * sc + 0.00000000000000000001);
+    k += 1;
+  );
+);
+
+/*
+ * One frame, in two halves so the main file can work out spectral gains in between: lp_frame_in
+ * transforms the windowed input (and measures the detector levels when asked); lp_frame_out applies the
+ * filter and overlap-adds the result.
+ */
+function lp_frame_in() local(i, p, b) (
+  b = LP_FBUF;
+  // The frame: the last LP_L samples, oldest first (LP_POS is the oldest)
+  i = 0; p = LP_POS;
+  loop(LP_L,
+    b[2 * i] = LP_INL[p] * LP_WIN[i];
+    b[2 * i + 1] = LP_INR[p] * LP_WIN[i];
+    (p += 1) >= LP_L ? p = 0;
+    i += 1;
+  );
+  memset(b + 2 * LP_L, 0, 2 * LP_L);
+  fft(b, LP_N);
+  fft_permute(b, LP_N);
+
+  // Detector levels for spectral dynamics
+  LP_WANT_LEVELS ? (
+    lp_levels(b, LP_LV);
+    LP_WANT_SC ? (
+      i = 0; p = LP_POS;
+      loop(LP_L,
+        LP_SCBUF[2 * i] = LP_SCL[p] * LP_WIN[i];
+        LP_SCBUF[2 * i + 1] = LP_SCR[p] * LP_WIN[i];
+        (p += 1) >= LP_L ? p = 0;
+        i += 1;
+      );
+      memset(LP_SCBUF + 2 * LP_L, 0, 2 * LP_L);
+      fft(LP_SCBUF, LP_N);
+      fft_permute(LP_SCBUF, LP_N);
+      lp_levels(LP_SCBUF, LP_SLV);
+    );
+  );
+);
+
+function lp_frame_out() local(k, j, i, b, zr, zi, wr, wi, xlr, xli, xrr, xri, h, ylr, yli, yrr, yri, u) (
+  b = LP_FBUF;
+  // Filter: bins k and LP_N - k together
+  k = 0;
+  loop(LP_NB,
+    j = k == 0 ? 0 : LP_N - k;
+    zr = b[2 * k]; zi = b[2 * k + 1]; wr = b[2 * j]; wi = b[2 * j + 1];
+    xlr = (zr + wr) * 0.5; xli = (zi - wi) * 0.5;
+    xrr = (zi + wi) * 0.5; xri = (wr - zr) * 0.5;
+    h = 2 * k;
+    ylr = LP_H11[h] * xlr - LP_H11[h + 1] * xli;
+    yli = LP_H11[h] * xli + LP_H11[h + 1] * xlr;
+    yrr = LP_H22[h] * xrr - LP_H22[h + 1] * xri;
+    yri = LP_H22[h] * xri + LP_H22[h + 1] * xrr;
+    LP_HCROSS ? (
+      ylr += LP_H12[h] * xrr - LP_H12[h + 1] * xri;
+      yli += LP_H12[h] * xri + LP_H12[h + 1] * xrr;
+      yrr += LP_H21[h] * xlr - LP_H21[h + 1] * xli;
+      yri += LP_H21[h] * xli + LP_H21[h + 1] * xlr;
+    );
+    // Repack: W[k] = YL[k] + i YR[k], W[N-k] = conj(YL[k]) + i conj(YR[k])
+    b[2 * k] = ylr - yri; b[2 * k + 1] = yli + yrr;
+    k > 0 && k < LP_L ? (b[2 * j] = ylr + yri; b[2 * j + 1] = yrr - yli);
+    k += 1;
+  );
+  fft_ipermute(b, LP_N);
+  ifft(b, LP_N);
+
+  // Overlap-add from the slot of the frame's oldest input (LP_OPOS, now - LP_L + 1)
+  u = LP_OPOS;
+  i = 0;
+  loop(LP_N,
+    LP_OUTL[u] += b[2 * i];
+    LP_OUTR[u] += b[2 * i + 1];
+    (u += 1) >= LP_N ? u = 0;
+    i += 1;
+  );
+);
+
+/*
+ * One sample through the engine: l and r in, lp_ol and lp_or out (LP_LAT samples late). scl, scr feed
+ * the sidechain ring. Returns 1 when a frame is due.
+ */
+function lp_tick(l, r, scl, scr) (
+  LP_INL[LP_POS] = l; LP_INR[LP_POS] = r;
+  LP_WANT_SC ? (LP_SCL[LP_POS] = scl; LP_SCR[LP_POS] = scr);
+  (LP_POS += 1) >= LP_L ? LP_POS = 0;
+  // The finished output for now - LP_L; its slot is then free for the frame that may follow
+  lp_ol = LP_OUTL[LP_OPOS]; lp_or = LP_OUTR[LP_OPOS];
+  LP_OUTL[LP_OPOS] = 0; LP_OUTR[LP_OPOS] = 0;
+  (LP_OPOS += 1) >= LP_N ? LP_OPOS = 0;
+  // Every hop a frame is due: the caller runs lp_frame_in, its spectral work, then lp_frame_out
+  (LP_HOPC += 1) >= LP_H ? (LP_HOPC = 0; 1) : 0;
+);
+
+/*
+ * Delay a pair by the engine's latency (for what bypasses it): returns in lp_dl, lp_dr
+ */
+function lp_delay(l, r) local(p, n) (
+  n = LP_LAT;
+  p = LP_DLY + 2 * LP_DPOS;
+  lp_dl = p[0]; lp_dr = p[1];
+  p[0] = l; p[1] = r;
+  (LP_DPOS += 1) >= n ? LP_DPOS = 0;
+);
+
+/*
+ * Set up for a frame of l samples (a power of two). Clears everything; sets LP_LAT, the latency.
+ */
+function lp_setup(l) local(i, n) (
+  LP_L = min(l, LP_LMAX); LP_N = 2 * LP_L; LP_H = LP_L / 2; LP_D = LP_L / 2; LP_NB = LP_L + 1;
+  LP_LAT = LP_L + LP_D;
+  i = 0;
+  loop(LP_L,
+    LP_WIN[i] = 0.5 - 0.5 * cos(2 * $pi * i / LP_L);
+    // Blackman taper over the response's LP_L samples, centred on LP_D
+    LP_IRWIN[i] = 0.42 - 0.5 * cos(2 * $pi * (i + 0.5) / LP_L) + 0.08 * cos(4 * $pi * (i + 0.5) / LP_L);
+    i += 1;
+  );
+  memset(LP_INL, 0, LP_L); memset(LP_INR, 0, LP_L);
+  memset(LP_SCL, 0, LP_L); memset(LP_SCR, 0, LP_L);
+  memset(LP_OUTL, 0, LP_N); memset(LP_OUTR, 0, LP_N);
+  memset(LP_DLY, 0, 2 * (LP_LMAX + LP_LMAX / 2 + 2));
+  memset(LP_LV, -150, 4 * LP_ROWL); memset(LP_SLV, -150, 4 * LP_ROWL);
+  LP_POS = 0; LP_HOPC = 0; LP_OPOS = 0; LP_DPOS = 0;
+  // Start as a pure delay: unity on the diagonal
+  lp_identity();
+  lp_design_full();
+);
+

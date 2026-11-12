@@ -1,0 +1,211 @@
+desc: ReEQ3 output transformers (BBC LL/81 MSC, Neve LO1166)
+/*
+  ReEQ3: a model of the BBC LL/81 MSC, the 1:1 10k bridging transformer (mu-metal core, mu-metal
+  screening can, 26 x 24 mm) used in BBC desks. "LL" is the BBC's own designation, not Lundahl's.
+
+  The equivalent circuit, referred to the primary (1:1), per channel:
+
+    source (40 ohm) - Rp (316 ohm) -+- leakage L - Rs (405 ohm) -+- 10k load
+                                    |                            |
+                          magnetising L (core)            winding/load C
+
+  Measured (ex-BBC units): primary inductance 49 H, primary DCR 316-320 ohm, secondary 405-411 ohm,
+  ratio 1:1, 10k:10k bridging. Not published, so estimated: the core's saturation curve, fitted so the
+  distortion matches a mu-metal 10k bridging transformer of the same class (Sowter 3575: 0.05% at
+  +20 dBu and 0.5% at +26 dBu, 50 Hz, 40 ohm source); leakage inductance 8 mH and capacitance 150 pF.
+
+  Two stages, as their time scales are far apart (the core's corner is about 1 Hz, the leakage
+  resonance about 150 kHz):
+  - the core: flux linkage lambda, d lambda/dt = v_A, with the magnetising current i(lambda) from a
+    mu-metal curve (a knee of power 3.5 and a hard saturation), solved implicitly (trapezoidal, Newton)
+    every sample;
+  - the leakage and capacitance: a second order low pass, its poles from the analogue ones and its
+    magnitude matched to the analogue at DC, fs/4 and Nyquist (Vicanek's matched second order filters),
+    so it doesn't cramp near Nyquist even though its resonance is far above it.
+
+  Level: 0 dBFS (a full scale sine) is +18 dBu, the EBU R68 alignment the BBC used. The drive raises
+  the level into the transformer and the same amount comes off after it, so only its colour changes.
+
+  MIT License, (c) 2026 Eloy Platas.
+*/
+
+@init
+
+/*
+ * Leakage inductance Ll and capacitance C (referred to the primary) with the series resistance Rser into
+ * the load RL: H(s) = RL / (s^2 Ll RL C + s (Ll + Rser RL C) + Rser + RL), DC gain taken out, as a second
+ * order low pass matched to the analogue at DC, fs/4 and Nyquist. Sets TXH_A1, TXH_A2, TXH_B0..TXH_B2.
+ */
+function tx_hf(sr, Ll, C, Rser, RL) local(w0, zt, wd, T, e, Hsq, f, s2r, dr, di, A0, A1, A2, B0, B1, B2, W, ph, HM, HN) (
+  w0 = sqrt((Rser + RL) / (Ll * RL * C));
+  zt = (Ll + Rser * RL * C) / (Ll * RL * C) / (2 * w0);
+  T = 1 / sr;
+  e = exp(-zt * w0 * T);
+  zt < 1 ? (
+    wd = w0 * sqrt(1 - zt * zt);
+    TXH_A1 = -2 * e * cos(wd * T);
+  ) : (
+    wd = w0 * sqrt(zt * zt - 1);
+    TXH_A1 = -2 * e * 0.5 * (exp(wd * T) + exp(-wd * T));
+  );
+  TXH_A2 = e * e;
+  f = sr / 4; ph = 0;
+  loop(2,
+    s2r = -sqr(2 * $pi * f);
+    dr = (s2r * Ll * RL * C + Rser + RL) / (Rser + RL);
+    di = (2 * $pi * f) * (Ll + Rser * RL * C) / (Rser + RL);
+    Hsq = 1 / (dr * dr + di * di);
+    ph == 0 ? HM = Hsq : HN = Hsq;
+    f = sr / 2; ph = 1;
+  );
+  A0 = sqr(1 + TXH_A1 + TXH_A2); A1 = sqr(1 - TXH_A1 + TXH_A2); A2 = -4 * TXH_A2;
+  B0 = A0; B1 = A1 * HN;
+  B2 = HM * (A0 * 0.5 + A1 * 0.5 + A2) - B0 * 0.5 - B1 * 0.5;
+  W = 0.5 * (sqrt(B0) + sqrt(B1));
+  TXH_B0 = 0.5 * (W + sqrt(max(W * W + B2, 0)));
+  TXH_B1 = 0.5 * (sqrt(B0) - sqrt(B1));
+  TXH_B2 = -B2 / (4 * TXH_B0);
+);
+
+function tx_setup(sr) (
+  TX_L0 = 49; TX_RP = 316; TX_RS = 405; TX_RSRC = 40; TX_RL = 10000;
+  TX_R1 = TX_RSRC + TX_RP; TX_R2 = TX_RS + TX_RL; TX_G = 1 / TX_R1 + 1 / TX_R2;
+  TX_VFS = 0.7746 * 10 ^ (18 / 20) * sqrt(2);
+  // The core: knee flux (1.11 x the peak flux of +26 dBu at 50 Hz), its power, and hard saturation
+  TX_LK = 1.11 * 0.7746 * 10 ^ (26 / 20) * sqrt(2) / (2 * $pi * 50);
+  TX_P = 3.5;
+  TX_LS = 3 * TX_LK;
+  TX_T = 1 / sr;
+  TX_NORM = (TX_R1 + TX_R2) / TX_R2;
+
+  tx_hf(sr, 0.008, 0.00000000015, TX_R1 + TX_RS, TX_RL);
+  TX_A1 = TXH_A1; TX_A2 = TXH_A2; TX_B0 = TXH_B0; TX_B1 = TXH_B1; TX_B2 = TXH_B2;
+);
+
+// The magnetising current and its slope
+function tx_i(l) local(a, s) (
+  a = abs(l) / TX_LK; s = max(1 - sqr(l / TX_LS), 0.02);
+  l / TX_L0 * (1 + a ^ TX_P) / s;
+);
+function tx_di(l) local(a, s, ap) (
+  a = abs(l) / TX_LK; ap = a ^ TX_P; s = 1 - sqr(l / TX_LS);
+  s > 0.02 ? (1 + (1 + TX_P) * ap) / (TX_L0 * s) + l * (1 + ap) / TX_L0 * (2 * l / sqr(TX_LS)) / (s * s)
+           : (1 + (1 + TX_P) * ap) / (TX_L0 * 0.02);
+);
+
+/*
+ * One sample of one channel (its state in the instance): x in, the transformed sample out, at the same
+ * level. g is the drive as a gain.
+ */
+function tx_tick(x, g) instance(lam, vp, x1, x2, y1, y2) local(vs, base, l, f, fp, va, y) (
+  vs = x * TX_VFS * g;
+  base = lam + TX_T * 0.5 * vp;
+  l = lam + TX_T * vp;
+  loop(3,
+    f = l - base - TX_T * 0.5 * (vs / TX_R1 - tx_i(l)) / TX_G;
+    fp = 1 + TX_T * 0.5 * tx_di(l) / TX_G;
+    l -= f / fp;
+  );
+  lam = l;
+  va = (vs / TX_R1 - tx_i(l)) / TX_G;
+  vp = va;
+  va *= TX_NORM / (TX_VFS * g);
+  // Leakage and capacitance
+  y = TX_B0 * va + TX_B1 * x1 + TX_B2 * x2 - TX_A1 * y1 - TX_A2 * y2;
+  x2 = x1; x1 = va; y2 = y1; y1 = y;
+  y;
+);
+
+function tx_reset() instance(lam, vp, x1, x2, y1, y2) (
+  lam = vp = x1 = x2 = y1 = y2 = 0;
+);
+
+function ne_i0(l) local(a, s) (
+  a = abs(l) / NE_LK; s = max(1 - sqr(l / NE_LS), 0.02);
+  l / NE_L0 * (1 + a ^ NE_P) / s;
+);
+function ne_di0(l) local(a, s, ap) (
+  a = abs(l) / NE_LK; ap = a ^ NE_P; s = 1 - sqr(l / NE_LS);
+  s > 0.02 ? (1 + (1 + NE_P) * ap) / (NE_L0 * s) + l * (1 + ap) / NE_L0 * (2 * l / sqr(NE_LS)) / (s * s)
+           : (1 + (1 + NE_P) * ap) / (NE_L0 * 0.02);
+);
+
+/*
+  Neve LO1166 (Marinair; Carnhill VTB1148 is the drop-in equivalent), the output transformer of the
+  1073/1084 era, driven by the BA283 output stage.
+
+  The BA283 is single ended class A: a 2N3055 with the LO1166 primary as its collector load, so the
+  standing current, about 60 mA, flows through the primary all the time. The core is gapped (0.003")
+  so that the DC doesn't saturate it, but the operating point still sits off centre on the B-H curve:
+  the flux swings further into the knee on one half cycle than on the other, which gives the even (2nd)
+  harmonic the 1073 is known for, rising at low frequencies. Feedback is taken from the primary, so the
+  stage looks like a source of roughly 90 ohm; it clips asymmetrically (the 3055 bottoms out harder than
+  it goes over the top), at about +28 dBm.
+
+  Referred to the primary: ratio 1:1.673 (200:600), 600 ohm load = 214 ohm, primary DCR 6+6 ohm,
+  secondary 20+20 ohm (Carnhill VTB1148), primary inductance 1.22 H (CJ's measurement, quoted by PRR).
+  Estimated: the steel's knee (3.5 x the bias flux, power 6, hard saturation at 1.5 x the knee), so the
+  transformer gives about 0.2% (mostly 2nd) at +20 dBu, 50 Hz; leakage 1 mH and 2 nF; the stage's own
+  curvature (0.05% 2nd at +20 dBu) and clipping knees.
+*/
+function ne_setup(sr) local(l, k) (
+  NE_N = 1.673; NE_L0 = 1.22; NE_IDC = 0.06;
+  NE_R1 = 90 + 12; NE_R2 = (40 + 600) / sqr(NE_N); NE_G = 1 / NE_R1 + 1 / NE_R2;
+  NE_LK = 3.5 * NE_L0 * NE_IDC; NE_P = 6; NE_LS = 1.5 * NE_LK;
+  NE_T = 1 / sr; NE_NORM = (NE_R1 + NE_R2) / NE_R2;
+  // the bias flux: i(l0) = Idc
+  l = NE_IDC * NE_L0;
+  k = 0; loop(60, l -= (ne_i0(l) - NE_IDC) / ne_di0(l); );
+  NE_L0B = l;
+  // the coupling of the stage (its DC servo), about 3 Hz
+  NE_HP = exp(-2 * $pi * 3 / sr);
+  NE_MK = 1 - exp(-1 / (0.3 * sr));
+  tx_hf(sr, 0.001, 0.000000002, NE_R1 + 40 / sqr(NE_N), 600 / sqr(NE_N));
+  NE_A1 = TXH_A1; NE_A2 = TXH_A2; NE_B0 = TXH_B0; NE_B1 = TXH_B1; NE_B2 = TXH_B2;
+);
+
+// The BA283 stage: its curvature, then asymmetric clipping (hard at the bottom, softer at the top)
+function ne_amp(v) local(c, k) (
+  v += v * v / 6550;
+  v > 0 ? (c = 19; k = 5) : (c = 16.5; k = 10);
+  v / (1 + abs(v / c) ^ k) ^ (1 / k);
+);
+
+function ne_tick(x, g) instance(lam, vp, x1, x2, y1, y2, hx, hy, pu, pc) local(vs, base, l, f, fp, va, y) (
+  vs = x * TX_VFS * g / NE_N;
+  pu = vs * vs;
+  vs = ne_amp(vs);
+  pc = vs * vs;
+  hy = NE_HP * (hy + vs - hx); hx = vs; vs = hy;
+  base = lam + NE_T * 0.5 * vp;
+  l = lam + NE_T * vp;
+  loop(3,
+    f = l - base - NE_T * 0.5 * (vs / NE_R1 - (ne_i0(l + NE_L0B) - NE_IDC)) / NE_G;
+    fp = 1 + NE_T * 0.5 * ne_di0(l + NE_L0B) / NE_G;
+    l -= f / fp;
+  );
+  lam = l;
+  va = (vs / NE_R1 - (ne_i0(l + NE_L0B) - NE_IDC)) / NE_G;
+  vp = va;
+  va *= NE_NORM * NE_N / (TX_VFS * g);
+  y = NE_B0 * va + NE_B1 * x1 + NE_B2 * x2 - NE_A1 * y1 - NE_A2 * y2;
+  x2 = x1; x1 = va; y2 = y1; y1 = y;
+  y;
+);
+
+function ne_reset() instance(lam, vp, x1, x2, y1, y2, hx, hy, pu, pc) (
+  lam = vp = x1 = x2 = y1 = y2 = hx = hy = pu = pc = 0;
+);
+
+/*
+ * Make-up for the stage's clipping: the drive is taken off again after the transformer, but once the
+ * BA283 clips, its ceiling would make the output drop by every dB of drive past it. So the power lost in
+ * the clipping (before against after, both channels, about 300 ms) is given back, slowly, as a pushed
+ * console channel would be ridden down by hand rather than pulled down by the drive. Below the clip it
+ * stays at 0 dB. Call once per sample after both channels' ne_tick.
+ */
+function ne_makeup(u, c) instance(eu, ec, gm) (
+  eu += NE_MK * (u - eu); ec += NE_MK * (c - ec);
+  gm = ec > 0.0000000001 ? min(max(sqrt(eu / ec), 1), 31.6) : 1;
+);
+
