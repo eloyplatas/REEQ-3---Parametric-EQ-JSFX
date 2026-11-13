@@ -1,6 +1,6 @@
 desc: ReEQ3 - Parametric Graphic Equalizer
 tags filters
-version: 3.3.0  //<--- Make sure you change VERSION below if this changes!!
+version: 3.4.0  //<--- Make sure you change VERSION below if this changes!!
 author: Eloy Platas, after ReEQ2 by Justin Johnson
 license: MIT
 
@@ -294,6 +294,7 @@ import Dependencies/reeq-analog-adapter.jsfx-inc
 import Dependencies/reeq3-lp.jsfx-inc
 import Dependencies/reeq3-luftikus.jsfx-inc
 import Dependencies/reeq3-ll81.jsfx-inc
+import Dependencies/reeq3-tonal.jsfx-inc
 
 in_pin:left input
 in_pin:right input
@@ -311,7 +312,7 @@ options:no_meter gmem=ReEQ3 maxmem=16777216
 @init
 
 // This should be the same as in the comment header
-#VERSION = "3.3.0";
+#VERSION = "3.4.0";
 
 gfx_ext_retina  = 1;
 
@@ -2294,6 +2295,9 @@ function chr_tick(x, ch) local(h, d, i, acc0, acc1, y0, y1, p, out) (
  */
 PUB_PTS = 256; PUB_N = 4096; PUB_HOP = 2048;
 GM_REG = 4096; GM_SLOTS = 64; GM_SLOT = 320; GM_NAME_LEN = 31; GM_SPEC = 40;
+// ReEQ3 remote editing (a slot per instance) and the tonal target for the Save Tonal Target action
+GM_RMT = GM_REG + GM_SLOTS * GM_SLOT; RM_SLOT = 512; RM_BANDS = 8; RM_CURVE = 136; RM_CMD = 400;
+GM_TBX = GM_RMT + GM_SLOTS * RM_SLOT;
 
 function pub_freq(i) ( 20 * 1000 ^ (i / (PUB_PTS - 1)); );
 
@@ -2408,11 +2412,151 @@ function eqm_capture_tick() local(i) (
   EQM_HasCap = 1;
 );
 
+/*
+ * ReEQ3 Tonal Balance, audio side: the output's average (TB_LIVE) and learning a target from this
+ * instance's input, its output or the sidechain, a measurement every PUB_HOP
+ */
+function tb_learn_seg() local(i, cr) (
+  TB_LSegN > 0 ? (
+    i = 0; loop(TB_PTS, TB_SEG[i] /= TB_LSegN; i += 1);
+    cr = TB_LCN > 0 && TB_LCMs / TB_LCN > 0.0000001 ? 20 * log10(TB_LCPk / sqrt(TB_LCMs / TB_LCN)) : -1;
+    tb_stats_add(TB_SEG, cr);
+    tb_stats_write(TBT, 0, TB_SMA) ? (TB_Target = 0; TB_Ver += 1);
+  );
+  memset(TB_SEG, 0, TB_PTS); TB_LSegN = 0; TB_LCPk = TB_LCMs = TB_LCN = 0;
+);
+function tb_learn_points() local(i) (
+  i = 0; loop(TB_PTS, TB_SEG[i] += TB_MEAS[i]; i += 1);
+  (TB_LSegN += 1) >= TB_SegLen ? tb_learn_seg();
+);
+// With the output's transform in PUB_FFT
+function tb_hop_post() local(i, a) (
+  memset(TB_MEAS, 0, TB_PTS);
+  tb_points(PUB_FFT, PUB_N, srate, TB_MEAS, 1);
+  // Silence leaves the average where it was
+  tb_klevel(TB_MEAS) > TB_GATE ? (
+    TB_LiveN += 1;
+    a = TB_Avg == 2 ? 1 / TB_LiveN : max(PUB_HOP / ((TB_Avg == 1 ? 10 : 3) * srate), 1 / TB_LiveN);
+    i = 0; loop(TB_PTS, TB_LIVE[i] += a * (TB_MEAS[i] - TB_LIVE[i]); i += 1);
+  );
+  TB_Learn == 2 ? tb_learn_points();
+);
+function tb_hop_learn() (
+  TB_Learn == 1 || TB_Learn == 3 ? (
+    TB_Learn == 1 ? pub_measure(PUB_RPRE, PUB_PRE_DB, 1) : pub_measure(PUB_RSC, PUB_SC_DB, 0.5);
+    memset(TB_MEAS, 0, TB_PTS);
+    tb_points(PUB_FFT, PUB_N, srate, TB_MEAS, 1);
+    tb_learn_points();
+  );
+);
+function tb_learn_start(src) (
+  TB_FA = 0;
+  tb_stats_clear();
+  memset(TB_SEG, 0, TB_PTS); TB_LSegN = 0; TB_LCPk = TB_LCMs = TB_LCN = 0;
+  TB_Learn = src;
+  #TB_Name = src == 1 ? "Learned from input" : src == 2 ? "Learned from output" : "Learned from sidechain";
+);
+// The crest meter: the last 3 s or 10 s of half-second chunks, or everything since the reset
+function tb_crest_update() local(w, k, i, pk, ms, n) (
+  TB_Avg == 2 ? (
+    TB_Crest = TB_CAllN > 0 ? 20 * log10(TB_CAllPk / sqrt(TB_CAllMs / TB_CAllN)) : 0;
+  ) : (
+    w = min(TB_Avg == 1 ? 20 : 6, TB_CCnt);
+    pk = ms = 0; n = 0; i = TB_CPos;
+    loop(w, i = (i + 31) % 32; pk = max(pk, TB_CRING[2 * i]); ms += TB_CRING[2 * i + 1]; n += 1);
+    TB_Crest = n > 0 ? 20 * log10(pk / sqrt(ms / n)) : 0;
+  );
+  TB_CrestOk = TB_CCnt > 0;
+);
+function tb_live_reset() (
+  memset(TB_LIVE, 0, TB_PTS); TB_LiveN = 0;
+  TB_CCnt = TB_CPos = 0; TB_CAllPk = TB_CAllMs = TB_CAllN = 0; TB_CrestOk = 0;
+  TB_CkPk = TB_CkMs = TB_CkN = 0;
+);
+
+/*
+ * ReEQ3 remote editing: an instance shows its bands and curve to another (in gmem, while watched) and
+ * takes band changes from it. Per slot: watched time, published time, write and read counts, the bands
+ * (8 words each), the curve (256 points, dB) and a ring of 8 commands (12 words: op, band, then the
+ * band's values). Ops: 1 set a band, 2 a new bell in a free band, 3 remove a band.
+ */
+function rm_mag(f) local(m) (
+  m = 1;
+  Band_Enabled[0] == BAND_STATE_ENABLED && (Band_Group[0] == 0 || (Band_Group[0] == 1 && Stereo_Mode == 0)) ? m *= gfx_band1.filter.ivf_analog_magnitude(f);
+  Band_Enabled[1] == BAND_STATE_ENABLED && (Band_Group[1] == 0 || (Band_Group[1] == 1 && Stereo_Mode == 0)) ? m *= gfx_band2.filter.ivf_analog_magnitude(f);
+  Band_Enabled[2] == BAND_STATE_ENABLED && (Band_Group[2] == 0 || (Band_Group[2] == 1 && Stereo_Mode == 0)) ? m *= gfx_band3.filter.ivf_analog_magnitude(f);
+  Band_Enabled[3] == BAND_STATE_ENABLED && (Band_Group[3] == 0 || (Band_Group[3] == 1 && Stereo_Mode == 0)) ? m *= gfx_band4.filter.ivf_analog_magnitude(f);
+  Band_Enabled[4] == BAND_STATE_ENABLED && (Band_Group[4] == 0 || (Band_Group[4] == 1 && Stereo_Mode == 0)) ? m *= gfx_band5.filter.ivf_analog_magnitude(f);
+  Band_Enabled[5] == BAND_STATE_ENABLED && (Band_Group[5] == 0 || (Band_Group[5] == 1 && Stereo_Mode == 0)) ? m *= gfx_band6.filter.ivf_analog_magnitude(f);
+  Band_Enabled[6] == BAND_STATE_ENABLED && (Band_Group[6] == 0 || (Band_Group[6] == 1 && Stereo_Mode == 0)) ? m *= gfx_band7.filter.ivf_analog_magnitude(f);
+  Band_Enabled[7] == BAND_STATE_ENABLED && (Band_Group[7] == 0 || (Band_Group[7] == 1 && Stereo_Mode == 0)) ? m *= gfx_band8.filter.ivf_analog_magnitude(f);
+  Band_Enabled[8] == BAND_STATE_ENABLED && (Band_Group[8] == 0 || (Band_Group[8] == 1 && Stereo_Mode == 0)) ? m *= gfx_band9.filter.ivf_analog_magnitude(f);
+  Band_Enabled[9] == BAND_STATE_ENABLED && (Band_Group[9] == 0 || (Band_Group[9] == 1 && Stereo_Mode == 0)) ? m *= gfx_band10.filter.ivf_analog_magnitude(f);
+  Band_Enabled[10] == BAND_STATE_ENABLED && (Band_Group[10] == 0 || (Band_Group[10] == 1 && Stereo_Mode == 0)) ? m *= gfx_band11.filter.ivf_analog_magnitude(f);
+  Band_Enabled[11] == BAND_STATE_ENABLED && (Band_Group[11] == 0 || (Band_Group[11] == 1 && Stereo_Mode == 0)) ? m *= gfx_band12.filter.ivf_analog_magnitude(f);
+  Band_Enabled[12] == BAND_STATE_ENABLED && (Band_Group[12] == 0 || (Band_Group[12] == 1 && Stereo_Mode == 0)) ? m *= gfx_band13.filter.ivf_analog_magnitude(f);
+  Band_Enabled[13] == BAND_STATE_ENABLED && (Band_Group[13] == 0 || (Band_Group[13] == 1 && Stereo_Mode == 0)) ? m *= gfx_band14.filter.ivf_analog_magnitude(f);
+  Band_Enabled[14] == BAND_STATE_ENABLED && (Band_Group[14] == 0 || (Band_Group[14] == 1 && Stereo_Mode == 0)) ? m *= gfx_band15.filter.ivf_analog_magnitude(f);
+  Band_Enabled[15] == BAND_STATE_ENABLED && (Band_Group[15] == 0 || (Band_Group[15] == 1 && Stereo_Mode == 0)) ? m *= gfx_band16.filter.ivf_analog_magnitude(f);
+  m;
+);
+function rm_publish(r) local(b, i, f, k) (
+  Rm_LastPub = time_precise();
+  // The drawing filters (its own window may be closed), from which the curve is read
+  update_visual_filters();
+  b = 0;
+  loop(NUM_BANDS,
+    k = r + RM_BANDS + b * 8;
+    gmem[k] = Band_Enabled[b]; gmem[k + 1] = Band_Group[b]; gmem[k + 2] = Band_Type[b]; gmem[k + 3] = Band_Frequency[b];
+    gmem[k + 4] = Band_Gain[b]; gmem[k + 5] = Band_Q[b]; gmem[k + 6] = Band_Slope[b];
+    b += 1;
+  );
+  i = 0;
+  loop(TB_PTS,
+    f = tb_freq(i);
+    gmem[r + RM_CURVE + i] = f < srate * 0.5 ? 20 * log10(max(rm_mag(f), 0.001)) : 0;
+    i += 1;
+  );
+  gmem[r + 1] = Rm_LastPub;
+);
+function rm_target_block() local(r, c, op, b, n) (
+  Pub_Slot >= 0 ? (
+    r = GM_RMT + Pub_Slot * RM_SLOT;
+    // A slot just taken: whatever waits in it was meant for someone else
+    Pub_Slot != Rm_SlotLive ? (gmem[r + 3] = gmem[r + 2]; Rm_SlotLive = Pub_Slot);
+    n = 0;
+    while (gmem[r + 3] < gmem[r + 2] && n < 8) (
+      c = r + RM_CMD + (gmem[r + 3] % 8) * 12;
+      op = gmem[c]; b = gmem[c + 1];
+      op == 2 ? (b = 0; while (b < NUM_BANDS && Band_Enabled[b] != BAND_STATE_OFF) (b += 1));
+      b >= 0 && b < NUM_BANDS ? (
+        op == 1 ? (
+          Band_Enabled[b] = gmem[c + 2]; Band_Group[b] = gmem[c + 3]; Band_Type[b] = gmem[c + 4];
+          Band_Frequency[b] = gmem[c + 5]; Band_Gain[b] = gmem[c + 6]; Band_Q[b] = gmem[c + 7]; Band_Slope[b] = gmem[c + 8];
+        ) : op == 2 ? (
+          Band_Enabled[b] = BAND_STATE_ENABLED; Band_Group[b] = 0; Band_Type[b] = FILTER_PEAK;
+          Band_Frequency[b] = gmem[c + 5]; Band_Gain[b] = gmem[c + 6]; Band_Q[b] = gmem[c + 7]; Band_Slope[b] = 1;
+          band_dyn_defaults(b);
+        ) : op == 3 ? (
+          Band_Enabled[b] = BAND_STATE_OFF;
+        );
+        flag_filter_update(b);
+        Rm_Changed = 1;
+      );
+      gmem[r + 3] += 1; n += 1;
+    );
+    Rm_Changed ? (filters_to_sliders(); Rm_Changed = 0; Rm_LastPub = time_precise() - 0.06);
+    time_precise() - gmem[r] < 1.5 && time_precise() - Rm_LastPub > 0.08 ? rm_publish(r);
+  );
+);
+
 // Per block: count samples and measure every PUB_HOP
 function pub_block() (
   (Pub_Count += samplesblock) >= PUB_HOP ? (
     Pub_Count = 0;
     pub_measure(PUB_RPOST, PUB_POST_DB, 0.5);
+    TB_Active ? tb_hop_post();
+    TB_Learn ? tb_hop_learn();
     (EQM_Run || EQM_Capturing) ? pub_measure(PUB_RPRE, PUB_PRE_DB, 1);
     (EQM_Run && EQM_Src == 1) || Ext_Src == 1 ? pub_measure(PUB_RSC, PUB_SC_DB, 0.5);
     pub_publish();
@@ -2434,6 +2578,11 @@ function reeq3_serialize_extra(write) (
   file_var(0, EQM_HasCap);
   file_mem(0, EQM_CAP, PUB_PTS);
   file_var(0, EQM_Bands);
+);
+// ReEQ3 Tonal Balance, from state version 114
+function tb_serialize() (
+  file_var(0, TB_Target); file_string(0, #TB_Name); file_var(0, TB_Avg); file_var(0, TB_View); file_var(0, TB_MBands);
+  file_mem(0, TBT, TB_TSIZE);
 );
 
 init_rate != srate ? (
@@ -2933,6 +3082,14 @@ compact_width = 0;
   // Luftikus mode
   MEMORY.index = lf_alloc(MEMORY.index);
   LF_LastKeep = -1; Lf_Live = 0;
+  // Tonal Balance
+  MEMORY.index = tb_alloc(MEMORY.index);
+  tb_setup(srate);
+  TB_RMB = MEMORY.alloc_memory(NUM_BANDS * 8);
+  tbca.tb_bq(0, 250, srate); tbcb.tb_bq(0, 250, srate); tbla.tb_bq(0, 250, srate); tblb.tb_bq(0, 250, srate);
+  TB_SegLen = ceil(3 * srate / PUB_HOP); TB_ChunkLen = floor(0.5 * srate);
+  TB_Solo = TB_SoloReq = TB_SoloHold = -1; TB_Learn = 0; TB_FA = 0; TB_RmDrag = TB_RmSel = -1;
+  tb_live_reset(); TB_Active = TB_ActiveLive = 0;
 );
 // Saved with the state, so allocated once (not again on a sample rate change)
 !reeq3_once ? (
@@ -2940,6 +3097,7 @@ compact_width = 0;
   EQM_CAP = 15000000; memset(EQM_CAP, -120, PUB_PTS);
   EQM_Bands = 8;
   Ext_Src = 0; Collisions_On = 1; Grab_On = 1;
+  TBT = 15010000; tb_factory(1, TBT); TB_Target = 1; #TB_Name = "Modern"; TB_Avg = 0; TB_View = 1; TB_MBands = 6;
   #Instance_Name = "";
 );
 // A new instance gets a tag of its own (a loaded state brings its saved one)
@@ -3060,6 +3218,7 @@ file_avail(handle) >= 0 ? (
       file_mem(0, Band_SpecDensity, numBands);
       file_mem(0, Band_SpecTilt, numBands);
       reeq3_serialize_extra(0);
+      version >= 114 ? (tb_serialize(); TB_Target > 0 ? tb_factory(TB_Target, TBT));
     ) : (
       band = 0;
       loop(numBands,
@@ -3096,7 +3255,7 @@ file_avail(handle) >= 0 ? (
   // Write mode
   // The version number should reflect the ReEQ version when the file
   // format changed.
-  version = 113;
+  version = 114;
 
   file_var(0, version);
   file_var(0, NUM_BANDS);
@@ -3128,6 +3287,7 @@ file_avail(handle) >= 0 ? (
   file_mem(0, Band_SpecDensity, NUM_BANDS);
   file_mem(0, Band_SpecTilt, NUM_BANDS);
   reeq3_serialize_extra(1);
+  tb_serialize();
 );
 
 flag_filter_update_all();
@@ -3140,9 +3300,28 @@ filters_to_sliders();
 // in @sample section
 
 AF_Clock+=samplesblock;
+// ReEQ3: band changes sent by another instance (remote editing), and showing this one's bands to it
+rm_target_block();
 update_audio_filters();
 AF_Pending || AF_Job>=0?ri_block_work();
 update_auto_gain();
+// ReEQ3 Tonal Balance: measured while its panel or overlay shows (or while learning)
+TB_Active = time_precise() - TB_Seen < 3 || TB_Learn > 0;
+(TB_Active && !TB_ActiveLive) || TB_ResetReq ? (tb_live_reset(); TB_ResetReq = 0);
+TB_ActiveLive = TB_Active;
+TB_CrestDue ? (tb_crest_update(); TB_CrestDue = 0);
+// The band solo: only while the panel holds it
+TB_SoloReq >= 0 && time_precise() - TB_Seen > 0.5 ? TB_SoloReq = -1;
+TB_SoloReq != TB_Solo ? (
+  TB_Solo = TB_SoloReq;
+  TB_Solo >= 0 ? (
+    tb_lpf = TB_Solo == 0 ? 250 : TB_Solo == 1 ? 2000 : 8000;
+    tb_hpf = TB_Solo == 1 ? 250 : TB_Solo == 2 ? 2000 : 8000;
+    tsl0a.tb_bq(0, tb_lpf, srate); tsl0b.tb_bq(0, tb_lpf, srate); tsl1a.tb_bq(0, tb_lpf, srate); tsl1b.tb_bq(0, tb_lpf, srate);
+    tsh0a.tb_bq(1, tb_hpf, srate); tsh0b.tb_bq(1, tb_hpf, srate); tsh1a.tb_bq(1, tb_hpf, srate); tsh1b.tb_bq(1, tb_hpf, srate);
+    tsl0a.tb_zero(); tsl0b.tb_zero(); tsl1a.tb_zero(); tsl1b.tb_zero(); tsh0a.tb_zero(); tsh0b.tb_zero(); tsh1a.tb_zero(); tsh1b.tb_zero();
+  );
+);
 pub_block();
 
 // Dynamic bands: enabled, a bell or shelf, with dynamics on
@@ -3816,6 +3995,31 @@ PUB_RPOST[PUB_POS] = (spl0 + spl1) * 0.5;
 PUB_RPRE[PUB_POS] = pub_in;
 PUB_RSC[PUB_POS] = (spl2 + spl3) * 0.5;
 (PUB_POS += 1) >= PUB_N ? PUB_POS = 0;
+
+// ReEQ3 Tonal Balance: the low end's crest (half-second chunks below 250 Hz), the learned source's, and
+// the band solo
+TB_Active ? (
+  tb_m = tbcb.tb_tick(tbca.tb_tick((spl0 + spl1) * 0.5));
+  TB_CkPk = max(TB_CkPk, abs(tb_m)); TB_CkMs += tb_m * tb_m;
+  (TB_CkN += 1) >= TB_ChunkLen ? (
+    TB_CkMs / TB_CkN > 0.0000001 ? (
+      TB_CRING[2 * TB_CPos] = TB_CkPk; TB_CRING[2 * TB_CPos + 1] = TB_CkMs / TB_CkN;
+      TB_CPos = (TB_CPos + 1) % 32; TB_CCnt = min(TB_CCnt + 1, 32);
+      TB_CAllPk = max(TB_CAllPk, TB_CkPk); TB_CAllMs += TB_CkMs / TB_CkN; TB_CAllN += 1;
+      TB_CrestDue = 1;
+    );
+    TB_CkPk = TB_CkMs = TB_CkN = 0;
+  );
+);
+TB_Learn ? (
+  tb_l = TB_Learn == 1 ? pub_in : TB_Learn == 2 ? (spl0 + spl1) * 0.5 : (spl2 + spl3) * 0.5;
+  tb_l = tblb.tb_tick(tbla.tb_tick(tb_l));
+  TB_LCPk = max(TB_LCPk, abs(tb_l)); TB_LCMs += tb_l * tb_l; TB_LCN += 1;
+);
+TB_Solo >= 0 ? (
+  TB_Solo != 3 ? (spl0 = tsl0b.tb_tick(tsl0a.tb_tick(spl0)); spl1 = tsl1b.tb_tick(tsl1a.tb_tick(spl1)));
+  TB_Solo != 0 ? (spl0 = tsh0b.tb_tick(tsh0a.tb_tick(spl0)); spl1 = tsh1b.tb_tick(tsh1a.tb_tick(spl1)));
+);
 
 // Output peak for the meter, read and reset by @gfx
 out_pk0 = max(out_pk0, abs(spl0));
@@ -5314,6 +5518,8 @@ function mouse_within_window() (
  */
 function mouse_within_panel() ( 
   // (ReEQ3: only while the panel shows, which needs a selected band)
+  ui_tb_show && !compact_width && !compact_height ?
+    (mouse_x >= ui_tb_x && mouse_x < ui_tb_x + ui_tb_w && mouse_y >= panel_y && mouse_y < panel_y + panel_h) :
   ui_lf_show && !compact_width && !compact_height ?
     (mouse_x >= ui_lf_x && mouse_x < ui_lf_x + ui_lf_w && mouse_y >= panel_y && mouse_y < panel_y + panel_h) :
     (ShowPanel && selected_node != -1 && (mouse_x >= panel_x && mouse_x < panel_x+panel_w && mouse_y >= panel_y && mouse_y < panel_y+panel_h));
@@ -7029,8 +7235,13 @@ function ui_draw_top() local(s, h, y, gw, gx, aw, ax, lab) (
   // ReEQ3: Luftikus mode, lit while it runs; it opens (or closes) its panel
   ui_top_lw = ui_text_w("Luftikus") + ui_pt(16); ui_top_lx = ui_top_ix - ui_pt(8) - ui_top_lw;
   ui_top_lx > ui_pt(150) ? (
-    ui_button(ui_top_lx, y, ui_top_lw, h, "Luftikus", Lf_On ? 1 : 0) ? (ui_lf_show = !ui_lf_show; ui_lf_show ? ui_lf_sel = selected_node);
+    ui_button(ui_top_lx, y, ui_top_lw, h, "Luftikus", Lf_On ? 1 : 0) ? (ui_lf_show = !ui_lf_show; ui_lf_show ? (ui_lf_sel = selected_node; ui_tb_show = 0));
     ui_lf_show && !Lf_On ? (ui_col(T_ACCENT_BORDER); gfx_roundrect(ui_top_lx, y, ui_top_lw - 1, h - 1, ui_pt(5), 1));
+  );
+  // ReEQ3: Tonal Balance, lit while its panel shows
+  ui_top_bw = ui_text_w("Balance") + ui_pt(16); ui_top_bx = ui_top_lx - ui_pt(8) - ui_top_bw;
+  ui_top_bx > ui_pt(150) ? (
+    ui_button(ui_top_bx, y, ui_top_bw, h, "Balance", ui_tb_show ? 1 : 0) ? (ui_tb_show = !ui_tb_show; ui_tb_show ? ui_lf_show = 0);
   );
   ui_icon_button(gx, y, gw, h, 5, ui_popup == 5 ? 1 : 0) ? (ui_popup = 5; ui_pop_skip = 1; ui_block = 1; ui_pop_x = gx; ui_pop_y = y; ui_pop_w = gw);
   gfx_setfont(FONT_BASE);
@@ -7850,19 +8061,12 @@ function eqm_bell_db(f, f0, q, g) local(o, ag, az, nr, ni, dr, di) (
   10 * log10((nr * nr + ni * ni) / (dr * dr + di * di));
 );
 
-function eqm_fit(nb) local(i, j, k, w, m, acc, n, best, bi, pk, l, r, bw, q, g, sh, num, den, pass, lo, hi, valid) (
-  EQM_Count < 3 ? (EQM_FitN = 0) : (
-    // The difference, reference over input, with no level offset (its mean over 100Hz..8kHz)
-    acc = 0; n = 0; i = 0;
-    loop(PUB_PTS,
-      lo = EQM_SUM_IN[i] / EQM_Count; hi = EQM_SUM_REF[i] / EQM_Count;
-      valid = lo > 0.000000001 && hi > 0.000000001 && pub_freq(i) < srate * 0.45;
-      EQM_DIFF[i] = valid ? 10 * log10(hi / lo) : 0;
-      EQM_FIT[i] = valid;
-      valid && pub_freq(i) > 100 && pub_freq(i) < 8000 ? (acc += EQM_DIFF[i]; n += 1);
-      i += 1;
-    );
+// The fit from EQM_DIFF (valid where EQM_FIT), its level offset taken out first
+function eqm_fit_diff(nb) local(i, j, k, w, m, acc, n, best, bi, pk, l, r, bw, q, g, sh, num, den, pass) (
+  (
     // The level offset is the median (a mean would follow the very bumps being matched)
+    acc = 0; n = 0; i = 0;
+    loop(PUB_PTS, EQM_FIT[i] && pub_freq(i) > 100 && pub_freq(i) < 8000 ? n += 1; i += 1);
     n > 0 ? (
       n = 0; i = 0;
       loop(PUB_PTS, EQM_FIT[i] && pub_freq(i) > 100 && pub_freq(i) < 8000 ? (EQM_RES[n] = EQM_DIFF[i]; n += 1); i += 1);
@@ -7929,6 +8133,22 @@ function eqm_fit(nb) local(i, j, k, w, m, acc, n, best, bi, pk, l, r, bw, q, g, 
   );
 );
 
+function eqm_fit(nb) local(i, j, k, w, m, acc, n, best, bi, pk, l, r, bw, q, g, sh, num, den, pass, lo, hi, valid) (
+  EQM_Count < 3 ? (EQM_FitN = 0) : (
+    // The difference, reference over input, with no level offset (its mean over 100Hz..8kHz)
+    acc = 0; n = 0; i = 0;
+    loop(PUB_PTS,
+      lo = EQM_SUM_IN[i] / EQM_Count; hi = EQM_SUM_REF[i] / EQM_Count;
+      valid = lo > 0.000000001 && hi > 0.000000001 && pub_freq(i) < srate * 0.45;
+      EQM_DIFF[i] = valid ? 10 * log10(hi / lo) : 0;
+      EQM_FIT[i] = valid;
+      valid && pub_freq(i) > 100 && pub_freq(i) < 8000 ? (acc += EQM_DIFF[i]; n += 1);
+      i += 1;
+    );
+    eqm_fit_diff(nb);
+  );
+);
+
 // The fit as new bells in free bands; returns how many went in
 function eqm_apply() local(k, b, n) (
   n = 0; k = 0;
@@ -7987,7 +8207,7 @@ function grab_reach(c0, d) local(c, m) (
 );
 function grab_find() local(s, c0, c, best, bc, lv, oct, l, r, minl, minr, prom, half, dbpu, a, b, d, off, fl, fr, bw) (
   ui_grab = 0;
-  Grab_On && Display_Mode != 2 && ui_popup == 0 && !ui_block && ui_fade > 0.5 && !mouse_within_panel() &&
+  Grab_On && !tb_rm_on && Display_Mode != 2 && ui_popup == 0 && !ui_block && ui_fade > 0.5 && !mouse_within_panel() &&
     mouse_y > TOP_MARGIN && mouse_y < gfx_h - BOTTOM_MARGIN - gfx_texth && get_nearest_node() == -1 && node_drag_mode == 0 &&
     box_region_drag_mode == 0 && button_focus == -1 &&
     // On or under the spectrum line (its highest point within 8pt, so a narrow peak is easy to reach)
@@ -8401,6 +8621,542 @@ function ui_draw_lf_panel() local(s, x, y, w, h, hy, hh, bx, bw, sp, cx, cy, v, 
   cx += sp + 64 * s;
   v = lf_knob(6, cx, cy, "TRIM", Lf_Trim, -20, 20, 1, 0.1, 0, "%.1f", "dB");
   v != Lf_Trim ? (Lf_Trim = v; slider_automate(Lf_Trim));
+  gfx_setfont(FONT_BASE);
+);
+
+/*
+ * ===================================================================================================
+ * ReEQ3 Tonal Balance: targets, the overlay on the graph, the panel, matching and remote editing
+ * ===================================================================================================
+ */
+
+// A target file (as the ReEQ3 Save Tonal Target action writes it): a header line, the name, then
+// TB_TSIZE numbers one per line. Returns 1 when it loaded.
+function tb_load_file(path) local(h, i, v, ok) (
+  ok = 0;
+  h = file_open(path);
+  h >= 0 ? (
+    file_text(h) ? (
+      #tb_l1 = ""; file_string(h, #tb_l1); #tb_l2 = ""; file_string(h, #tb_l2);
+      str_trim(#tb_l1); str_trim(#tb_l2);
+      !strncmp(#tb_l1, "ReEQ3 tonal target", 18) ? (
+        i = 0;
+        while (i < TB_TSIZE && file_avail(h) > 0) (v = 0; file_var(h, v); TB_TMP[i] = v; i += 1);
+        i >= TB_TSIZE - 3 && TB_TMP[TB_OVALID] == 1 ? (
+          memcpy(TBT, TB_TMP, TB_TSIZE); strcpy(#TB_Name, #tb_l2); TB_Target = 0; TB_Ver += 1; ok = 1;
+        );
+      );
+    );
+    file_close(h);
+  );
+  ok;
+);
+
+// The library: Data/ReEQ3/Targets/index.txt, one name per line (the files are <name>.txt beside it)
+function tb_lib_read() local(h) (
+  TB_LibN = 0;
+  h = file_open("ReEQ3/Targets/index.txt");
+  h >= 0 ? (
+    file_text(h) ? while (file_avail(h) > 0 && TB_LibN < 40) (
+      #tb_ll = ""; file_string(h, #tb_ll); str_trim(#tb_ll);
+      strlen(#tb_ll) > 0 ? (strcpy(960 + TB_LibN, #tb_ll); TB_LibN += 1);
+    );
+    file_close(h);
+  );
+  TB_LibN;
+);
+
+function tb_set_factory(k) (
+  tb_factory(k, TBT); TB_Target = k; TB_Learn = 0; TB_FA = 0; TB_Ver += 1;
+  #TB_Name = k == 1 ? "Modern" : k == 2 ? "Bass Heavy" : k == 3 ? "Acoustic / Orchestral" : "Pink noise";
+);
+
+/*
+ * Building a target from dropped audio files, a slice per frame (strings 900.. hold their paths):
+ * 3 s segments of 50%-overlapped transforms, the low end's crest per segment
+ */
+function tb_fa_start() (
+  TB_Learn = 0;
+  tb_stats_clear();
+  TB_FA = 1; TB_FA_I = 0; TB_FA_H = -1; TB_FA_Files = 0; TB_FA_Bad = 0;
+);
+function tb_fa_seg() local(i, cr) (
+  TB_FA_SegN > 0 ? (
+    i = 0; loop(TB_PTS, TB_FSEG[i] /= TB_FA_SegN; i += 1);
+    cr = TB_FCN > 0 && TB_FCMs / TB_FCN > 0.0000001 ? 20 * log10(TB_FCPk / sqrt(TB_FCMs / TB_FCN)) : -1;
+    tb_stats_add(TB_FSEG, cr);
+  );
+  memset(TB_FSEG, 0, TB_PTS); TB_FA_SegN = 0; TB_FCPk = TB_FCMs = TB_FCN = 0;
+);
+function tb_fa_name(dst, path) local(i, n, c, a, e) (
+  n = strlen(path); a = 0; e = n; i = 0;
+  loop(n, c = str_getchar(path, i); c == '/' || c == '\\' ? a = i + 1; c == '.' ? e = i; i += 1);
+  e <= a ? e = n;
+  strcpy_substr(dst, path, a, e - a);
+);
+function tb_fa_step() local(ch, sr, n, i, x, y, t0) (
+  t0 = time_precise();
+  while (TB_FA && time_precise() - t0 < 0.03) (
+    TB_FA_H < 0 ? (
+      TB_FA_I >= TB_FA_N ? (
+        // Done: the statistics become the target
+        TB_FA = 0;
+        tb_stats_write(TBT, TB_FA_Files, TB_SMG) ? (
+          tb_fa_name(#TB_Name, 900);
+          TB_FA_Files > 1 ? strcat(#TB_Name, sprintf(#, " +%d", TB_FA_Files - 1));
+          TB_Target = 0; TB_Ver += 1; TB_Msg = 0;
+        ) : TB_Msg = 1;
+      ) : (
+        TB_FA_H = file_open(900 + TB_FA_I);
+        ch = sr = 0;
+        TB_FA_H >= 0 ? file_riff(TB_FA_H, ch, sr);
+        TB_FA_H >= 0 && ch >= 1 && sr >= 8000 ? (
+          TB_FA_Ch = ch; TB_FA_Sr = sr;
+          TB_FA_Nfft = sr > 100000 ? 16384 : sr > 50000 ? 8192 : 4096;
+          TB_FA_Pos = 0; TB_FA_Tot = max(file_avail(TB_FA_H), 1); TB_FA_Done = 0;
+          TB_FA_SegLen = ceil(3 * sr / (TB_FA_Nfft / 2));
+          memset(TB_FSEG, 0, TB_PTS); TB_FA_SegN = 0; TB_FCPk = TB_FCMs = TB_FCN = 0;
+          tbfa.tb_bq(0, 250, sr); tbfb.tb_bq(0, 250, sr); tbfa.tb_zero(); tbfb.tb_zero();
+        ) : (
+          TB_FA_H >= 0 ? file_close(TB_FA_H);
+          TB_FA_H = -1; TB_FA_I += 1; TB_FA_Bad += 1;
+        );
+      );
+    ) : (
+      n = min(file_avail(TB_FA_H), floor(131072 / TB_FA_Ch) * TB_FA_Ch);
+      n = floor(n / TB_FA_Ch) * TB_FA_Ch;
+      n > 0 ? (
+        file_mem(TB_FA_H, TB_RD, n);
+        TB_FA_Done += n;
+        i = 0;
+        loop(n / TB_FA_Ch,
+          x = TB_FA_Ch >= 2 ? (TB_RD[i] + TB_RD[i + 1]) * 0.5 : TB_RD[i];
+          y = tbfb.tb_tick(tbfa.tb_tick(x));
+          TB_FCPk = max(TB_FCPk, abs(y)); TB_FCMs += y * y; TB_FCN += 1;
+          TB_FB[TB_FA_Pos] = x;
+          (TB_FA_Pos += 1) >= TB_FA_Nfft ? (
+            tb_measure_lin(TB_FB, TB_FA_Nfft, TB_FA_Sr, TB_FSEG, 1);
+            TB_FA_SegN += 1;
+            memcpy(TB_FB, TB_FB + TB_FA_Nfft / 2, TB_FA_Nfft / 2);
+            TB_FA_Pos = TB_FA_Nfft / 2;
+            TB_FA_SegN >= TB_FA_SegLen ? tb_fa_seg();
+          );
+          i += TB_FA_Ch;
+        );
+      ) : (
+        // The end: a last segment of at least a second counts
+        TB_FA_SegN >= TB_FA_SegLen / 3 ? tb_fa_seg();
+        file_close(TB_FA_H); TB_FA_H = -1; TB_FA_I += 1; TB_FA_Files += 1;
+      );
+    );
+  );
+);
+
+// Files dropped on the window: audio builds a target, a .txt target file loads
+function tb_drop() local(k, n, e) (
+  k = 0; n = 0;
+  while (gfx_getdropfile(k, #tb_dp)) (
+    e = strlen(#tb_dp);
+    e > 4 && !stricmp(strcpy_substr(#tb_de, #tb_dp, e - 4, 4), ".txt") ? (
+      tb_load_file(#tb_dp) ? (TB_Learn = 0; TB_FA = 0) : TB_Msg = 2;
+    ) : n < 32 ? (
+      strcpy(900 + n, #tb_dp); n += 1;
+    );
+    k += 1;
+  );
+  k > 0 ? (
+    gfx_getdropfile(-1);
+    ui_tb_show = 1; ui_lf_show = 0;
+    n > 0 ? (TB_FA_N = n; tb_fa_start());
+  );
+);
+
+// The target menu
+function tb_menu() local(k, i, nlib) (
+  nlib = tb_lib_read();
+  #tb_m = sprintf(#, "%sModern|%sBass Heavy|%sAcoustic / Orchestral|%sPink noise||>Library",
+    TB_Target == 1 ? "!" : "", TB_Target == 2 ? "!" : "", TB_Target == 3 ? "!" : "", TB_Target == 4 ? "!" : "");
+  nlib == 0 ? strcat(#tb_m, "|<#(empty: save one with the action ReEQ3 Save Tonal Target)") : (
+    i = 0;
+    loop(nlib, strcat(#tb_m, i == nlib - 1 ? "|<" : "|"); strcat(#tb_m, 960 + i); i += 1);
+  );
+  strcat(#tb_m, sprintf(#, "||%sLearn from this input (while playing)|%sLearn from the output|%sLearn from the sidechain (pins 3/4)",
+    TB_Learn == 1 ? "!" : "", TB_Learn == 2 ? "!" : "", TB_Learn == 3 ? "!" : ""));
+  strcat(#tb_m, "||#Drop audio files on the window to build a target from them");
+  gfx_x = ui_tb_mx; gfx_y = ui_tb_my;
+  k = gfx_showmenu(#tb_m);
+  // Items: 4 factory, the library (or its one placeholder), 3 learn, the hint
+  k >= 1 && k <= 4 ? tb_set_factory(k) :
+  k > 4 && k <= 4 + max(nlib, 1) ? (
+    nlib > 0 ? (
+      #tb_lp = "ReEQ3/Targets/"; strcat(#tb_lp, 960 + k - 5); strcat(#tb_lp, ".txt");
+      tb_load_file(#tb_lp) ? (TB_Learn = 0; TB_FA = 0) : TB_Msg = 2;
+    );
+  ) : k > 4 + max(nlib, 1) && k <= 7 + max(nlib, 1) ? (
+    k -= 4 + max(nlib, 1);
+    TB_Learn == k ? TB_Learn = 0 : tb_learn_start(k);
+  );
+);
+
+// For the Save Tonal Target action: this target, its name and this instance's tag, while the panel shows
+function tb_export() local(b, n, i) (
+  b = GM_TBX;
+  gmem[b] = time_precise(); gmem[b + 1] = Instance_Tag;
+  n = min(strlen(#TB_Name), 60); gmem[b + 2] = n;
+  i = 0; loop(n, gmem[b + 3 + i] = str_getchar(#TB_Name, i); i += 1);
+  i = 0; loop(TB_TSIZE, gmem[b + 100 + i] = TBT[i]; i += 1);
+);
+
+// The fit to the target: what would bring the output to the target's mean, as bells
+function tb_fit(nb) local(i, f, v) (
+  i = 0;
+  loop(PUB_PTS,
+    f = pub_freq(i);
+    v = TBT[TB_OVALID] && TB_LiveN > 0 && f > 25 && f < min(18000, srate * 0.45);
+    EQM_FIT[i] = v; EQM_DIFF[i] = v ? -TB_DEV[i] : 0;
+    i += 1;
+  );
+  eqm_fit_diff(nb);
+  TB_Fitted = EQM_Fitted; EQM_Fitted = 0;
+);
+
+/*
+ * Remote editing, the controlling side: the watched instance's slot, sending commands
+ */
+function rm_slot() ( TB_Rmt != 0 ? pub_find(TB_Rmt) : -1; );
+function rm_send(op, b, en, grp, ty, f, g, q, sl) local(r, k, c) (
+  TB_RmS >= 0 ? (
+    r = GM_RMT + TB_RmS * RM_SLOT;
+    k = gmem[r + 2];
+    k - gmem[r + 3] < 8 ? (
+      c = r + RM_CMD + (k % 8) * 12;
+      gmem[c] = op; gmem[c + 1] = b; gmem[c + 2] = en; gmem[c + 3] = grp; gmem[c + 4] = ty;
+      gmem[c + 5] = f; gmem[c + 6] = g; gmem[c + 7] = q; gmem[c + 8] = sl;
+      gmem[r + 2] = k + 1;
+      1;
+    ) : 0;
+  ) : 0;
+);
+function rm_has_gain(t) (
+  !(t == 1 || t == 2 || t == 5 || t == 6 || t == 7 || t == 8 || t == 11 || t == 12 || t == 13);
+);
+function rm_node_y(k) local(t) (
+  t = TB_RMB[k + 2];
+  max(db_to_y(rm_has_gain(t) ? TB_RMB[k + 4] : 0), TOP_MARGIN);
+);
+// The watched instance's bands into TB_RMB (the band being dragged keeps its own values)
+function rm_pull() local(r, b, j) (
+  r = GM_RMT + TB_RmS * RM_SLOT;
+  b = 0;
+  loop(NUM_BANDS,
+    b != TB_RmDrag ? (j = 0; loop(8, TB_RMB[b * 8 + j] = gmem[r + RM_BANDS + b * 8 + j]; j += 1));
+    b += 1;
+  );
+);
+function rm_send_band(b) local(k) (
+  k = b * 8;
+  rm_send(1, b, TB_RMB[k], TB_RMB[k + 1], TB_RMB[k + 2], TB_RMB[k + 3], TB_RMB[k + 4], TB_RMB[k + 5], TB_RMB[k + 6]);
+);
+function rm_hit() local(b, d, best, bi, k) (
+  best = sqr(ui_pt(11)); bi = -1; b = 0;
+  loop(NUM_BANDS,
+    k = b * 8;
+    TB_RMB[k] != BAND_STATE_OFF ? (
+      d = sqr(mouse_x - freq_to_scx(TB_RMB[k + 3])) + sqr(mouse_y - rm_node_y(k));
+      d < best ? (best = d; bi = b);
+    );
+    b += 1;
+  );
+  bi;
+);
+// The mouse over the graph while editing another instance: drag a node (frequency, and gain where it has
+// one), the wheel for its Q, a right-click removes it, a double-click on empty graph adds a bell
+function rm_mouse(wd) local(b, k, f, g, now) (
+  now = time_precise();
+  ui_press ? (
+    b = rm_hit();
+    b >= 0 ? (TB_RmDrag = b; TB_RmSel = b) : (
+      now - TB_RmLastClick < 0.35 && abs(mouse_x - TB_RmCX) < 5 && abs(mouse_y - TB_RmCY) < 5 ? (
+        rm_send(2, -1, 0, 0, 0, min(max(scx_to_freq(mouse_x), 20), 20000), min(max(y_to_db(mouse_y), -30), 30), 1, 1);
+        TB_RmLastClick = 0;
+      ) : (TB_RmLastClick = now; TB_RmCX = mouse_x; TB_RmCY = mouse_y);
+    );
+  );
+  TB_RmDrag >= 0 && (mouse_cap & 1) ? (
+    k = TB_RmDrag * 8;
+    f = min(max(scx_to_freq(mouse_x), 20), min(20000, 0.45 * srate));
+    g = rm_has_gain(TB_RMB[k + 2]) ? min(max(floor(y_to_db(mouse_y) * 10 + 0.5) / 10, -30), 30) : TB_RMB[k + 4];
+    f != TB_RMB[k + 3] || g != TB_RMB[k + 4] ? (TB_RMB[k + 3] = f; TB_RMB[k + 4] = g; rm_send_band(TB_RmDrag));
+  );
+  !(mouse_cap & 1) ? TB_RmDrag = -1;
+  wd != 0 && (b = rm_hit()) >= 0 ? (
+    k = b * 8;
+    TB_RMB[k + 5] = min(max(TB_RMB[k + 5] * 2 ^ (wd > 0 ? 0.1 : -0.1), 0.1), 40);
+    rm_send_band(b);
+  );
+  ui_rpress && (b = rm_hit()) >= 0 ? (rm_send(3, b, 0, 0, 0, 0, 0, 0, 0); TB_RMB[b * 8] = BAND_STATE_OFF);
+);
+function rm_draw() local(r, i, x, y, lx, ly, b, k, sz, bottom) (
+  r = GM_RMT + TB_RmS * RM_SLOT;
+  bottom = gfx_h - BOTTOM_MARGIN - gfx_texth;
+  // Its curve, in the accent colour
+  ui_col(T_ACCENT); lx = -1; i = 0;
+  loop(TB_PTS,
+    pub_freq(i) < srate * 0.5 ? (
+      x = pub_x(i); y = min(db_to_y(gmem[r + RM_CURVE + i]), bottom);
+      lx >= 0 ? ui_thick_line(lx, ly, x, y, ui_pt(2));
+      lx = x; ly = y;
+    );
+    i += 1;
+  );
+  // Its nodes, in their bands' colours
+  b = 0;
+  loop(NUM_BANDS,
+    k = b * 8;
+    TB_RMB[k] != BAND_STATE_OFF ? (
+      x = freq_to_scx(TB_RMB[k + 3]); y = rm_node_y(k);
+      sz = b == TB_RmSel ? ui_pt(8) : ui_pt(7);
+      ui_band_col(b); gfx_a = TB_RMB[k] == BAND_STATE_ENABLED ? 1 : 0.35;
+      gfx_circle(x, y, sz, 1, 1);
+      ui_cola(b == TB_RmSel ? T_HIGHLIGHT : T_NODE_EDGE, 1); gfx_circle(x, y, sz, 0, 1);
+      gfx_setfont(FONT_NODE); ui_col(T_BADGE_TEXT); ui_text_at(x, y, sprintf(#, "%d", b + 1));
+    );
+    b += 1;
+  );
+  // What's being edited
+  gfx_setfont(FONT_CAP_B); ui_col(T_ACCENT);
+  #tb_rn = "EDITING  "; strcat(#tb_rn, inst_name(#tb_rn2, TB_RmS));
+  ui_text_l(ui_pt(14), TOP_MARGIN + ui_pt(4), ui_pt(16), #tb_rn);
+  gfx_setfont(FONT_BASE);
+);
+
+/*
+ * The overlay on the graph: the target's range and the output's average. Spectrum: on the analyser's
+ * scale (per-hertz levels, lined up with the analyser on this instance's output). Leveled: the output
+ * against the target on the EQ's dB scale, so a bump above the band is a cut to make.
+ */
+function tb_draw_overlay() local(i, f, x, lx, t0, t1, b0, b1, y, ly, d, n, acc, bottom, m, sd, dn, a0, x0) (
+  TBT[TB_OVALID] ? (
+    bottom = gfx_h - BOTTOM_MARGIN - gfx_texth;
+    TB_View == 1 ? (
+      pub_calibrate();
+      // Line up with the analyser: the median gap over 100Hz..8kHz, eased
+      n = 0; i = 0;
+      loop(TB_PTS,
+        f = tb_freq(i);
+        f > 100 && f < 8000 && PUB_POST_DB[i] > -80 && TB_LiveN > 0 ? (TB_TMP[n] = PUB_POST_DB[i] - (TB_UD[i] - 10 * log10(f / 1000)); n += 1);
+        i += 1;
+      );
+      n > 20 ? (
+        i = 1;
+        loop(n - 1, m = TB_TMP[i]; d = i - 1; while (d >= 0 && TB_TMP[d] > m) (TB_TMP[d + 1] = TB_TMP[d]; d -= 1); TB_TMP[d + 1] = m; i += 1);
+        TB_OffOk ? TB_Off += 0.08 * (TB_TMP[floor(n / 2)] - TB_Off) : (TB_Off = TB_TMP[floor(n / 2)]; TB_OffOk = 1);
+      );
+      !TB_OffOk ? TB_Off = -30;
+    );
+    // The range
+    ui_col(T_ACCENT);
+    lx = -1; i = 0;
+    loop(TB_PTS,
+      f = tb_freq(i);
+      f < srate * 0.5 ? (
+        x = pub_x(i); m = TBT[TB_OM + i]; sd = TBT[TB_OS + i];
+        TB_View == 1 ? (
+          dn = TB_Off - 10 * log10(f / 1000);
+          t1 = min(pub_y(m + sd + dn, f), bottom); b1 = min(pub_y(m - sd + dn, f), bottom);
+        ) : (t1 = min(db_to_y(sd), bottom); b1 = min(db_to_y(-sd), bottom));
+        lx >= 0 ? (gfx_a = 0.16; gfx_triangle(lx, t0, x, t1, x, b1, lx, b0));
+        lx = x; t0 = t1; b0 = b1;
+      );
+      i += 1;
+    );
+    // The target's mean, dotted
+    TB_View == 1 ? (
+      gfx_a = 0.5; i = 0;
+      loop(TB_PTS / 2, f = tb_freq(2 * i); f < srate * 0.5 ? gfx_circle(pub_x(2 * i), min(pub_y(TBT[TB_OM + 2 * i] + TB_Off - 10 * log10(f / 1000), f), bottom), 0.6, 1, 1); i += 1);
+    );
+    // The bands' edges
+    ui_col(T_ACCENT); gfx_a = 0.25;
+    x0 = freq_to_scx(250); gfx_line(x0, TOP_MARGIN, x0, bottom, 0);
+    x0 = freq_to_scx(2000); gfx_line(x0, TOP_MARGIN, x0, bottom, 0);
+    x0 = freq_to_scx(8000); gfx_line(x0, TOP_MARGIN, x0, bottom, 0);
+    // The output's average, white
+    TB_LiveN > 0 ? (
+      ui_col(T_HIGHLIGHT); a0 = 0.95;
+      lx = -1; i = 0;
+      loop(TB_PTS,
+        f = tb_freq(i);
+        f < srate * 0.5 ? (
+          x = pub_x(i);
+          y = TB_View == 1 ? pub_y(TB_UD[i] + TB_Off - 10 * log10(f / 1000), f) : db_to_y(TB_DEV[i]);
+          y = min(max(y, TOP_MARGIN), bottom);
+          gfx_a = abs(TB_DEV[i]) > TBT[TB_OS + i] ? a0 : a0 * 0.75;
+          lx >= 0 ? ui_thick_line(lx, ly, x, y, ui_pt(1.6));
+          lx = x; ly = y;
+        );
+        i += 1;
+      );
+    );
+    gfx_a = 1;
+  );
+  // The match's preview: its bells' curve
+  TB_Fitted && EQM_FitN > 0 && ui_tb_show ? (
+    ui_col(T_ACCENT); gfx_a = 0.9;
+    lx = -1; i = 0;
+    loop(PUB_PTS,
+      f = pub_freq(i);
+      acc = 0; n = 0; loop(EQM_FitN, acc += eqm_bell_db(f, EQM_FF[n], EQM_FQ[n], EQM_FG[n]); n += 1);
+      x = pub_x(i); y = db_to_y(acc);
+      lx >= 0 && (i % 2) ? gfx_line(lx, ly, x, y, 1);
+      lx = x; ly = y; i += 1;
+    );
+    gfx_a = 1;
+  );
+);
+
+/*
+ * The panel: header (target, view, averaging), the broad bands (hold a band's name to solo it), the
+ * low end's crest factor, status, and matching (which EQ, how many bands, preview and apply)
+ */
+function tb_bar(x, y, w, h, b, dv, sd, inb) local(s, sc, cy, yy, t, hov, lab) (
+  s = ui_pt(1);
+  lab = b == 0 ? "LOW" : b == 1 ? "LOW-MID" : b == 2 ? "HIGH-MID" : "HIGH";
+  hov = ui_in(x, y, w, 16 * s);
+  ui_press && hov && ui_free() ? TB_SoloHold = b;
+  gfx_setfont(inb ? FONT_CAP_B : FONT_CAP);
+  ui_col(TB_SoloReq == b ? T_ACCENT : inb && TB_LiveN > 0 ? T_HIGHLIGHT : hov ? T_TEXT : T_TEXT_DIM);
+  ui_text_c(x, y, w, 16 * s, TB_SoloReq == b ? "SOLO" : lab);
+  // +-8 dB around the target's mean
+  t = y + 18 * s; yy = h - 18 * s; cy = t + yy * 0.5; sc = yy / 16;
+  ui_box(x + w * 0.3, t, w * 0.4, yy, 3 * s, T_CONTROL, 1, T_BORDER_SUBTLE);
+  ui_cola(T_ACCENT_FILL, 1); gfx_rect(x + w * 0.3 + 1, cy - sd * sc, w * 0.4 - 2, 2 * sd * sc);
+  ui_cola(T_ACCENT_BORDER, 1); gfx_line(x + w * 0.3 + 1, cy, x + w * 0.7 - 2, cy, 0);
+  TB_LiveN > 0 ? (
+    yy = min(max(cy - dv * sc, t + 1), t + h - 18 * s - 2);
+    ui_col(T_HIGHLIGHT); ui_thick_line(x + w * 0.22, yy, x + w * 0.78, yy, ui_pt(2));
+    gfx_setfont(FONT_CAP); ui_col(T_TEXT_DIM);
+    gfx_x = x + w * 0.8; gfx_y = yy - gfx_texth * 0.5; gfx_drawstr(sprintf(#, "%+.1f", dv));
+  );
+);
+
+function ui_draw_tb_panel() local(s, x, y, w, h, hy, hh, bx, bw, k, i, cx, cw, by, bh, lo, hi, sc, px, t, nm, slot, pr) (
+  s = ui_pt(1);
+  w = floor(min(820 * s, gfx_w - 8 * s)); h = panel_h;
+  x = floor(gfx_w / 2 - w / 2); y = panel_y;
+  ui_tb_x = x; ui_tb_w = w;
+  pr = ui_press && ui_free();
+  ui_cola(T_PANEL, 1); ui_fill_rrect(x, y, w, h, 8 * s);
+  ui_cola(T_BORDER, 1); gfx_roundrect(x, y, w - 1, h - 1, 8 * s, 1);
+  ui_cola(T_ACCENT_BORDER, 1); gfx_line(x + 8 * s, y, x + w - 8 * s, y, 1);
+
+  // Header: name, target, view, averaging, close
+  hy = y + 6 * s; hh = 24 * s;
+  gfx_setfont(FONT_BODY_B); ui_col(T_ACCENT);
+  ui_text_l(x + 14 * s, hy, hh, "TONAL BALANCE");
+  bx = x + 14 * s + ui_text_w("TONAL BALANCE") + 12 * s;
+  bw = 200 * s;
+  #tb_tl = TB_Learn ? "● " : ""; strcat(#tb_tl, #TB_Name);
+  ui_dropdown(bx, hy, bw, hh, #tb_tl, 0) ? (ui_tb_mx = bx; ui_tb_my = hy + hh; tb_menu());
+  bx += bw + 10 * s;
+  k = ui_segn(bx, hy, 170 * s, hh, 3, TB_View, pr, "Off", "Spectrum", "Leveled", "", "");
+  k >= 0 ? TB_View = k;
+  bx += 170 * s + 10 * s;
+  k = ui_segn(bx, hy, 110 * s, hh, 3, TB_Avg, pr, "3 s", "10 s", "∞", "", "");
+  k >= 0 ? (TB_Avg = k; TB_ResetReq = 1);
+  bx += 110 * s + 6 * s;
+  ui_button(bx, hy, 52 * s, hh, "Reset", 0) ? TB_ResetReq = 1;
+  ui_icon_button(x + w - 10 * s - 26 * s, hy, 26 * s, hh, 10, 0) ? ui_tb_show = 0;
+  ui_col(T_BORDER_SUBTLE);
+  gfx_line(x + 12 * s, y + 36 * s, x + w - 12 * s, y + 36 * s, 0);
+
+  // Broad view
+  by = y + 42 * s; bh = h - 50 * s;
+  cw = 64 * s; cx = x + 12 * s;
+  tb_bar(cx, by, cw, bh, 0, TB_BD0, TBT[TB_OBS], TB_IN0); cx += cw;
+  tb_bar(cx, by, cw, bh, 1, TB_BD1, TBT[TB_OBS + 1], TB_IN1); cx += cw;
+  tb_bar(cx, by, cw, bh, 2, TB_BD2, TBT[TB_OBS + 2], TB_IN2); cx += cw;
+  tb_bar(cx, by, cw, bh, 3, TB_BD3, TBT[TB_OBS + 3], TB_IN3); cx += cw;
+  !(mouse_cap & 1) ? TB_SoloHold = -1;
+  TB_SoloReq = TB_SoloHold;
+
+  // The low end's crest factor, 4..24 dB, its target range
+  cx += 14 * s; cw = 230 * s;
+  gfx_setfont(FONT_CAP); ui_col(T_TEXT_SECONDARY);
+  ui_text_l(cx, by, 16 * s, "LOW-END CREST FACTOR");
+  t = by + 20 * s; lo = 4; hi = 24; sc = cw / (hi - lo);
+  ui_box(cx, t, cw, 14 * s, 3 * s, T_CONTROL, 1, T_BORDER_SUBTLE);
+  ui_cola(T_ACCENT_FILL, 1);
+  px = cx + (min(max(TBT[TB_OCM] - TBT[TB_OCS], lo), hi) - lo) * sc;
+  gfx_rect(px, t + 1, (min(max(TBT[TB_OCM] + TBT[TB_OCS], lo), hi) - lo) * sc + cx - px, 14 * s - 2);
+  TB_CrestOk ? (
+    px = cx + (min(max(TB_Crest, lo), hi) - lo) * sc;
+    ui_col(T_HIGHLIGHT); ui_thick_line(px, t - 2 * s, px, t + 16 * s, ui_pt(2));
+  );
+  gfx_setfont(FONT_CAP); ui_col(T_TEXT_DIM);
+  ui_text_l(cx, t + 16 * s, 14 * s, "dynamic");
+  gfx_x = cx; gfx_y = t + 16 * s; gfx_drawstr("compressed", 2 | 4, cx + cw, t + 30 * s);
+  gfx_setfont(FONT_BODY_B); ui_col(T_TEXT);
+  ui_text_l(cx, t + 34 * s, 18 * s, TB_CrestOk ? sprintf(#, "%.1f dB", TB_Crest) : "—");
+  gfx_setfont(FONT_CAP); ui_col(T_TEXT_DIM);
+  TB_CrestOk ? (
+    ui_text_l(cx + 70 * s, t + 34 * s, 18 * s,
+      TB_Crest > TBT[TB_OCM] + TBT[TB_OCS] ? "more dynamic than the target" :
+      TB_Crest < TBT[TB_OCM] - TBT[TB_OCS] ? "more compressed than the target" : "within the target");
+  );
+  // Status: what the target is, or what's going on
+  t += 58 * s;
+  gfx_setfont(FONT_CAP); ui_col(TB_Msg ? T_DANGER : T_TEXT_DIM);
+  TB_FA ? (
+    sprintf(#tb_st, "Analysing file %d of %d · %d%%", TB_FA_I + 1, TB_FA_N, TB_FA_H >= 0 ? floor(100 * TB_FA_Done / TB_FA_Tot) : 0);
+  ) : TB_Learn ? (
+    sprintf(#tb_st, "Learning · %d segments (%d s) · click the target to stop", TBT[TB_OSEG] * TBT[TB_OVALID], 3 * TBT[TB_OSEG] * TBT[TB_OVALID]);
+  ) : TB_Msg == 1 ? strcpy(#tb_st, "Nothing usable in those files (silent, or not audio)") :
+      TB_Msg == 2 ? strcpy(#tb_st, "That isn't a ReEQ3 tonal target file") :
+      TB_Target > 0 ? strcpy(#tb_st, "Factory shape: drawn up, not measured") :
+      TBT[TB_OFILES] > 0 ? sprintf(#tb_st, "From %d file%s · %d segments", TBT[TB_OFILES], TBT[TB_OFILES] > 1 ? "s" : "", TBT[TB_OSEG]) :
+      sprintf(#tb_st, "%d segments", TBT[TB_OSEG]);
+  ui_text_l(cx, t, 14 * s, #tb_st);
+  TB_FA_Bad > 0 && !TB_FA ? (t += 14 * s; ui_text_l(cx, t, 14 * s, sprintf(#, "%d file%s couldn't be read", TB_FA_Bad, TB_FA_Bad > 1 ? "s" : "")));
+
+  // Matching: which EQ, how many bells, preview, apply
+  cx += cw + 18 * s; cw = x + w - 12 * s - cx;
+  ui_col(T_BORDER_SUBTLE); gfx_line(cx - 9 * s, by, cx - 9 * s, by + bh, 0);
+  gfx_setfont(FONT_CAP); ui_col(T_TEXT_SECONDARY);
+  ui_text_l(cx, by, 16 * s, "MATCH TO TARGET");
+  slot = rm_slot();
+  TB_Rmt != 0 && slot < 0 ? (TB_Rmt = 0);
+  #tb_eq = "EQ: "; strcat(#tb_eq, TB_Rmt ? inst_name(#tb_en, slot) : "this instance");
+  ui_dropdown(cx, by + 18 * s, cw, 22 * s, #tb_eq, 0) ? (
+    // This instance, then the others running
+    #tb_im = TB_Rmt == 0 ? "!This instance" : "This instance"; TB_IMN = 0; i = 0;
+    loop(GM_SLOTS,
+      gmem[GM_REG + i * GM_SLOT + 1] != 0 && gmem[GM_REG + i * GM_SLOT + 1] != Instance_Tag && time_precise() - gmem[GM_REG + i * GM_SLOT] < 30 ? (
+        strcat(#tb_im, gmem[GM_REG + i * GM_SLOT + 1] == TB_Rmt ? "|!" : "|"); strcat(#tb_im, inst_name(#tb_en, i));
+        INST_ROWS[TB_IMN] = i; TB_IMN += 1;
+      );
+      i += 1;
+    );
+    gfx_x = cx; gfx_y = by + 40 * s;
+    k = gfx_showmenu(#tb_im);
+    k == 1 ? TB_Rmt = 0 : k > 1 ? (TB_Rmt = gmem[GM_REG + INST_ROWS[k - 2] * GM_SLOT + 1]; TB_RmDrag = -1; TB_RmSel = -1);
+    TB_Fitted = 0;
+  );
+  k = ui_segn(cx, by + 46 * s, cw, 22 * s, 4, TB_MBands == 4 ? 0 : TB_MBands == 6 ? 1 : TB_MBands == 8 ? 2 : 3, pr, "4", "6", "8", "12", "");
+  k >= 0 ? (TB_MBands = k == 0 ? 4 : k == 1 ? 6 : k == 2 ? 8 : 12; TB_Fitted ? tb_fit(TB_MBands));
+  bw = (cw - 6 * s) / 2;
+  ui_button(cx, by + 74 * s, bw, 24 * s, TB_Fitted ? "Hide" : "Preview", TB_Fitted ? 1 : 0) ? (
+    TB_Fitted ? TB_Fitted = 0 : tb_fit(TB_MBands);
+  );
+  ui_button(cx + bw + 6 * s, by + 74 * s, bw, 24 * s, "Apply", 0) ? (
+    !TB_Fitted ? tb_fit(TB_MBands);
+    TB_Fitted && EQM_FitN > 0 ? (
+      TB_Rmt == 0 ? eqm_apply() : (
+        TB_RmS = slot; k = 0;
+        loop(EQM_FitN, rm_send(2, -1, 0, 0, 0, EQM_FF[k], EQM_FG[k], EQM_FQ[k], 1); k += 1);
+      );
+      TB_Fitted = 0;
+    );
+  );
   gfx_setfont(FONT_BASE);
 );
 
@@ -9308,6 +10064,21 @@ Ghost_Band >= 0 ? (
 !UI_EMBED ? grab_follow();
 !UI_EMBED ? draw_eqm_preview();
 
+// ReEQ3 Tonal Balance: dropped files, file analysis, the comparison and its overlay; remote editing
+!UI_EMBED ? (
+  tb_drop();
+  TB_FA ? tb_fa_step();
+  ui_tb_show ? (
+    TB_Seen = time_precise();
+    TBT[TB_OVALID] ? tb_compare(TBT);
+    ui_tb_show && time_precise() - TB_ExpT > 0.5 ? (tb_export(); TB_ExpT = time_precise());
+  );
+  !ui_tb_show ? (TB_SoloReq = TB_SoloHold = -1; TB_Fitted = 0);
+  tb_rm_on = ui_tb_show && TB_Rmt != 0 && !compact_width && !compact_height && (TB_RmS = rm_slot()) >= 0;
+  tb_rm_on ? (gmem[GM_RMT + TB_RmS * RM_SLOT] = time_precise(); rm_pull());
+  ui_tb_show && TB_View > 0 && Display_Mode != 2 && !compact_width && !compact_height ? tb_draw_overlay();
+);
+
 
 ht = (gfx_h - BOTTOM_MARGIN - gfx_texth) + 2;
 
@@ -9332,7 +10103,7 @@ loop(NUM_BANDS, (
   );
 );
 
-draw_filter_bands();
+!tb_rm_on ? draw_filter_bands();
 
 // Determine which filter response curves to draw
 drawMid = 0;
@@ -9353,25 +10124,27 @@ while (
 );
 
 // Mid
-drawMid ? draw_filter_response(1, T_CURVE_MID);
+!tb_rm_on && drawMid ? draw_filter_response(1, T_CURVE_MID);
 
 // Side
-drawSide ? draw_filter_response(2, T_CURVE_SIDE);
+!tb_rm_on && drawSide ? draw_filter_response(2, T_CURVE_SIDE);
 
 // Left
-drawLeft ? draw_filter_response(3, T_CURVE_LEFT);
+!tb_rm_on && drawLeft ? draw_filter_response(3, T_CURVE_LEFT);
 
 // Right
-drawRight ? draw_filter_response(4, T_CURVE_RIGHT);
+!tb_rm_on && drawRight ? draw_filter_response(4, T_CURVE_RIGHT);
 
 // ReEQ3: Luftikus mode's own curve
 draw_lf_curve();
 
 // Stereo
-draw_filter_response(0, T_CURVE);
+!tb_rm_on ? draw_filter_response(0, T_CURVE);
+// ReEQ3: another instance being edited from here: its curve and nodes instead
+tb_rm_on ? rm_draw();
 
 // Dynamic bands: their static settings while they move
-draw_dyn_static();
+!tb_rm_on ? draw_dyn_static();
 
 // The header goes over anything that reaches above the graph
 ui_draw_header();
@@ -9400,19 +10173,22 @@ ui_fade > 0 ? (
   do_listen || listen_node != -1 ? draw_listen_helper();
 
   !very_compact_height && !very_compact_width ? (
-    draw_info_panel();
+    !tb_rm_on ? draw_info_panel();
   );
 
-  draw_dyn_range();
-  draw_dyn_detectors();
-  draw_nodes();
+  !tb_rm_on ? (
+    draw_dyn_range();
+    draw_dyn_detectors();
+    draw_nodes();
+  );
 ) : ( 
   ui_rh_on = 0;
   listen_node != -1 ? draw_listen_helper();
   node_drag_mode != 0 || is_box_dragging() ? (
-    draw_info_panel();
-    
-    draw_nodes();
+    !tb_rm_on ? (
+      draw_info_panel();
+      draw_nodes();
+    );
   );
 );
 
@@ -9468,6 +10244,11 @@ ui_popup == 0 && !ui_block && node_drag_mode == 0 && button_focus == -1 ? (
 );
 
 do_general_mouse = ui_popup == 0 && !ui_block && !ui_chrome_press && !ui_rdrag && !ui_ddrag;
+// ReEQ3: editing another instance, the graph's mouse is that instance's
+tb_rm_on && do_general_mouse ? (
+  tb_rm_in = !mouse_within_panel() && mouse_y > HEADER_H && mouse_y < gfx_h - BOTTOM_MARGIN;
+  (tb_rm_in || TB_RmDrag >= 0) ? (rm_mouse(tb_rm_in ? mouse_wheel - last_wheel : 0); do_general_mouse = 0);
+);
 
 // While it sits out, keep its state current: a release must not act on a press it never saw,
 // wheel movement must not pile up, and listen ends with the modifier
@@ -9955,6 +10736,7 @@ ui_popup == 6 && (compact_width || compact_height || ui_key == 27) ? ui_popup = 
 ui_popup == 8 && (UI_EMBED || ui_key == 27) ? ui_popup = 0;
 (ui_popup == 10 || ui_popup == 11) && (compact_height || compact_width || ui_key == 27) ? (ui_popup = 0; ui_inst_edit = 0);
 ui_popup == 0 && ui_lf_show && ui_key == 27 ? ui_lf_show = 0;
+ui_popup == 0 && ui_tb_show && ui_key == 27 ? ui_tb_show = 0;
 // The value stepper, when its control goes away or turns inert
 ui_popup == 9 && (ui_key == 27 || !sv_live(ui_sv_id, ui_sv_b)) ? ui_popup = 0;
 
@@ -9990,6 +10772,7 @@ ui_fade > 0 ? (
   // ReEQ3: the Luftikus panel takes the band panel's place while shown; picking a band closes it
   ui_lf_show && selected_node != ui_lf_sel && selected_node != -1 ? ui_lf_show = 0;
   ui_lf_sel = selected_node;
+  ui_tb_show && !compact_width && !compact_height ? ui_draw_tb_panel() :
   ui_lf_show && !compact_width && !compact_height ? ui_draw_lf_panel() :
   ShowPanel && selected_node != -1 ? ui_draw_panel();
   ui_popup == 3 ? ui_draw_node_card();

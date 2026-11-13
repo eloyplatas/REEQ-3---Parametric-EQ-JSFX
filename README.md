@@ -4,7 +4,7 @@
 
 ReEQ³ es un ecualizador paramétrico JSFX para REAPER. Parte de **ReEQ² 2.2.0** de Justin Johnson ([ReJJ](https://github.com/Justin-Johnson/ReJJ), MIT) y le añade las funciones de FabFilter Pro‑Q 4 que se pueden hacer en JSFX. Conserva todo lo de ReEQ²: 16 bandas, filtros ajustados a la curva analógica hasta Nyquist, dinámica por banda con tres sidechains, lookahead, analizador y temas.
 
-**Manual** (inglés y castellano): [ReEQ3-Manual-EN-ES.pdf](ReEQ3-Manual-EN-ES.pdf). Versión actual: **3.3.0**.
+**Manual** (inglés y castellano): [ReEQ3-Manual-EN-ES.pdf](ReEQ3-Manual-EN-ES.pdf). Versión actual: **3.4.0**.
 
 ## Instalación
 
@@ -12,6 +12,7 @@ ReEQ³ es un ecualizador paramétrico JSFX para REAPER. Parte de **ReEQ² 2.2.0*
 2. Copia los scripts de `Scripts/` en `REAPER/Scripts/` y cárgalos desde *Actions › New action › Load ReaScript*:
    - `ReEQ2 upgrade to ReEQ3.lua` pasa los ReEQ² (y ReEQ) del proyecto a ReEQ³ conservando todos sus ajustes.
    - `ReEQ3 Theme Editor.lua` es el editor de temas. Usa los mismos temas que ReEQ² (`Data/ReEQ2`), y las ventanas de ReEQ³ abiertas siguen los cambios en directo.
+   - `ReEQ3 Save Tonal Target.lua` guarda el objetivo de Tonal Balance de la instancia con el panel abierto en la biblioteca de objetivos.
 3. Requisitos: REAPER 7.45 o posterior (lo mismo que ReEQ² 2.2). La lista de instancias usa `get_host_placement`, disponible desde REAPER 6.74.
 
 > Para escribir valores en la ventana del plugin, activa *Send all keyboard input to plug-in* en el menú de la ventana de FX. Si no, REAPER intercepta las teclas.
@@ -104,6 +105,26 @@ El knob de transformador de la barra inferior (junto a OUT) pone al final de la 
   - Valores: relación 1:1,673 (200:600), 1,22 H de primario, DCR 6+6 / 20+20 Ω, fuente de unos 90 Ω y recorte hacia +28 dBm (GroupDIY: PRR, CJ, Geoff Tanner; guía de Carnhill). Estimados: la rodilla del acero, la curvatura y el recorte de la etapa, 1 mH de fuga y 2 nF.
 - **Medido en el plugin**: LL/81 0,051 % / 0,52 % de THD a +20 / +26 dBu (50 Hz); LO1166 0,25 % (sobre todo 2.º) / 0,68 %. Las respuestas quedan a menos de 0,03 dB y 0,11 dB de sus circuitos analógicos. Sin latencia.
 
+## Tonal Balance
+
+![Tonal Balance](ReEQ3-tonal-balance.png)
+
+El botón **Balance** de la cabecera abre un panel que compara la media a largo plazo de la salida con un **objetivo**, al estilo de los medidores de equilibrio tonal. Todo se mide tras normalizar la sonoridad (ponderación K), así que compara equilibrio, no nivel.
+
+- **Vistas**:
+  - *Spectrum*: el margen del objetivo y la media de la salida, sobre la escala del analizador.
+  - *Leveled*: la salida frente al objetivo en la escala de dB del EQ. Un bulto por encima de la franja es un recorte que hacer ahí.
+  - Media de 3 s, 10 s o ∞, con Reset.
+- **Bandas anchas**: LOW 20–250 Hz, LOW‑MID 250 Hz–2 kHz, HIGH‑MID 2–8 kHz y HIGH 8–20 kHz, con su margen. Mantén pulsado el nombre de una banda para escucharla sola (cruces Linkwitz‑Riley de 24 dB/oct).
+- **Crest factor del grave** (pico/RMS por debajo de 250 Hz) frente al margen del objetivo.
+- **Objetivos**:
+  - Cuatro formas de fábrica (Modern, Bass Heavy, Acoustic / Orchestral y Pink noise). Son formas dibujadas, no medidas.
+  - Arrastra **archivos de audio** a la ventana para construir un objetivo con ellos: segmentos de 3 s, media y dispersión. WAV siempre; otros formatos si REAPER los decodifica en JSFX.
+  - **Aprende** de la entrada, de la salida o del sidechain mientras suena.
+  - **Biblioteca**: la acción `ReEQ3 Save Tonal Target.lua` guarda el objetivo en `REAPER/Data/ReEQ3/Targets` y aparece en el menú de todas las instancias. Un `.txt` de objetivo arrastrado a la ventana también se carga.
+- **Match to target**: 4, 6, 8 o 12 campanas que llevan la salida a la media del objetivo, con vista previa y *Apply*.
+- **Editar otra instancia**: en el selector *EQ* elige otro ReEQ³. La gráfica pasa a editar esa instancia (arrastrar nodos, rueda para la Q, clic derecho para quitar, doble clic para añadir), y *Apply* pone allí la corrección. Así se puede tener el panel en el máster y el EQ en un bus o una pista. La comunicación va por `gmem`.
+
 ## Valores por defecto
 
 Una instancia nueva arranca con el espectro del analizador en **Full**, los ajustes estéreo de la barra inferior en **L/R** y la inclinación del analizador a **0 dB/oct**.
@@ -112,13 +133,15 @@ Una instancia nueva arranca con el espectro del analizador en **Full**, los ajus
 
 - ReEQ³ es un archivo distinto: los proyectos con ReEQ² no cambian hasta que ejecutes el script de migración.
 - Los sliders 1‑233 son los de ReEQ². ReEQ³ añade los sliders 234‑238 (Output Pan, Pan Mode, Character, Processing Mode y Linear Phase Resolution), 239‑250 (modo Luftikus) y 251‑253 (transformador de salida: encendido, drive y modelo).
-- El estado guardado es la versión 113. Los estados de ReEQ² se cargan sin cambiar el sonido: sus campanas, shelves y tilt shelves entran a 12 dB/oct.
+- El estado guardado es la versión 114 (añade el objetivo de Tonal Balance). Los estados de ReEQ² se cargan sin cambiar el sonido: sus campanas, shelves y tilt shelves entran a 12 dB/oct.
 
 ## Limitaciones conocidas
 
 - En fase lineal con resolución Low (un FIR de 2048 muestras) se pierde detalle por debajo de unos 60 Hz, como en cualquier EQ de fase lineal. Para cortes graves pronunciados usa High o Very High.
 - En fase lineal, el detector de una banda dinámica oye medio marco por delante, así que tiene su propio lookahead.
 - Las bandas espectrales con sidechain escuchan todas el mismo par de sidechain: el primero que se elige.
+- Tonal Balance solo mide con su panel abierto (o mientras aprende), y su panel ocupa el sitio del panel de banda.
+- Al editar otra instancia se dibuja la curva de sus bandas estéreo y mid; las side, left y right se ven solo como nodos. La instancia editada tiene que estar procesando audio.
 - La lista de instancias necesita que los otros ReEQ³ estén procesando audio. Con el transporte parado muestran su último espectro durante 30 s.
 
 ## Créditos y licencia

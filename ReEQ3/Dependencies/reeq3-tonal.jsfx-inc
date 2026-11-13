@@ -1,0 +1,244 @@
+desc: ReEQ3 Tonal Balance engine
+/*
+  ReEQ3: Tonal Balance. A long-term average of the output compared with a target: the target's mean
+  level per point and its spread (one standard deviation), over the shared spectra's 256 points (20 Hz to
+  20 kHz). Every level is the power in a third of an octave around the point (pink noise reads flat),
+  normalised by the K-weighted level of the whole spectrum, so the comparison is of balance, not loudness.
+
+  A target is built from segments of about 3 s: each segment's levels, normalised on their own, add to
+  the mean and the spread (silent segments are left out). The four broad bands (20-250 Hz, 250 Hz-2 kHz,
+  2-8 kHz, 8-20 kHz) and the low end's crest factor (peak to RMS below 250 Hz) are kept the same way.
+
+  Target layout (TB_TSIZE words): mean[256], spread[256], band mean[4], band spread[4], crest mean,
+  crest spread, valid, segments, files.
+
+  MIT License, (c) 2026 Eloy Platas.
+*/
+
+@init
+
+TB_PTS = 256; TB_TSIZE = 525;
+TB_OM = 0; TB_OS = 256; TB_OBM = 512; TB_OBS = 516; TB_OCM = 520; TB_OCS = 521; TB_OVALID = 522; TB_OSEG = 523; TB_OFILES = 524;
+TB_GATE = -55;
+
+function tb_freq(i) ( 20 * 1000 ^ (i / (TB_PTS - 1)); );
+function tb_band_of(f) ( f < 250 ? 0 : f < 2000 ? 1 : f < 8000 ? 2 : 3; );
+
+// K-weighting as a power gain at f: BS.1770's high shelf (+4 dB, 1.68 kHz) and its high pass (38 Hz)
+function tb_kw(f) local(o, a, sa, q, nr, ni, dr, di, hs, hp) (
+  o = f / 1681.97; a = 10 ^ (4 / 40); sa = sqrt(a); q = 0.7072;
+  nr = a * (1 - a * o * o); ni = a * sa / q * o;
+  dr = a - o * o; di = sa / q * o;
+  hs = (nr * nr + ni * ni) / (dr * dr + di * di);
+  o = f / 38.135; q = 0.5003;
+  hp = o * o * o * o / (sqr(1 - o * o) + sqr(o / q));
+  hs * hp;
+);
+
+function tb_alloc(mem) (
+  // The transform's buffer inside one 65536-word block (fft_real's rule)
+  mem = ceil(mem / 65536) * 65536;
+  TB_FFT = mem; mem += 32768;
+  TB_KW = mem; mem += TB_PTS;
+  TB_LIVE = mem; mem += TB_PTS;      // the output's average power per point
+  TB_PTMP = mem; mem += TB_PTS;      // the factory shapes
+  TB_MEAS = mem; mem += TB_PTS;      // one measurement (audio side)
+  TB_FSEG = mem; mem += TB_PTS;      // a file segment's sum (drawing side)
+  TB_SMA = mem; mem += TB_PTS; TB_SMG = mem; mem += TB_PTS;   // smoothing scratch, audio and drawing side
+  TB_RD = mem; mem += 131072;        // file reads
+  TB_SEG = mem; mem += TB_PTS;       // a segment's sum
+  TB_S1 = mem; mem += TB_PTS; TB_S2 = mem; mem += TB_PTS;
+  TB_B1 = mem; mem += 4; TB_B2 = mem; mem += 4;
+  TB_DEV = mem; mem += TB_PTS;       // the output against the target (dB), smoothed
+  TB_UD = mem; mem += TB_PTS;        // the output, normalised (dB)
+  TB_CRING = mem; mem += 64;         // the crest meter's chunks: peak, mean square
+  TB_FB = mem; mem += 16384;
+  TB_TMP = mem; mem += TB_TSIZE;
+  mem;
+);
+
+function tb_setup(sr) local(i) (
+  i = 0; loop(TB_PTS, TB_KW[i] = tb_kw(tb_freq(i)); i += 1);
+);
+
+/*
+ * The points from a transform already in buf (fft_real of n windowed samples, permuted, as the shared
+ * spectra leave it): each point's third-octave power, added to out (times w)
+ */
+function tb_points(buf, n, sr, out, w) local(i, f, lo, hi, df, k0, k1, k, acc, p, x, kf, sc) (
+  df = sr / n;
+  // fft_real is twice the complex transform; Hann's power gain is 0.375; one side counts twice
+  sc = 2 / (4 * n * n * 0.375);
+  i = 0;
+  loop(TB_PTS,
+    f = tb_freq(i);
+    lo = f * 2 ^ (-1 / 6); hi = f * 2 ^ (1 / 6);
+    hi < sr * 0.49 ? (
+      k0 = max(ceil(lo / df), 1); k1 = min(floor(hi / df), n / 2 - 1);
+      k1 - k0 >= 1 ? (
+        acc = 0; k = k0;
+        loop(k1 - k0 + 1, acc += sqr(buf[2 * k]) + sqr(buf[2 * k + 1]); k += 1);
+        p = acc * sc;
+      ) : (
+        // Narrower than two bins: the power density there, times the width
+        kf = f / df; k = max(floor(kf), 1); x = kf - k;
+        acc = (1 - x) * (sqr(buf[2 * k]) + sqr(buf[2 * k + 1])) + x * (sqr(buf[2 * k + 2]) + sqr(buf[2 * k + 3]));
+        p = acc * sc * (hi - lo) / df;
+      );
+      out[i] += w * p;
+    );
+    i += 1;
+  );
+);
+
+// A linear block of n samples, windowed and transformed in TB_FFT, its points added to out
+function tb_measure_lin(src, n, sr, out, w) local(i) (
+  i = 0;
+  loop(n, TB_FFT[i] = src[i] * (0.5 - 0.5 * cos(2 * $pi * i / n)); i += 1);
+  fft_real(TB_FFT, n);
+  fft_permute(TB_FFT, n / 2);
+  TB_FFT[1] = 0;
+  tb_points(TB_FFT, n, sr, out, w);
+);
+
+// A level array's K-weighted level (dB)
+function tb_klevel(p) local(i, acc) (
+  acc = 0; i = 0;
+  loop(TB_PTS, acc += p[i] * TB_KW[i]; i += 1);
+  10 * log10(acc + 0.0000000000001);
+);
+// A band's level (dB), its points' mean power
+function tb_bandlevel(p, b) local(i, acc, n, f) (
+  acc = 0; n = 0; i = 0;
+  loop(TB_PTS, f = tb_freq(i); tb_band_of(f) == b && f < 20001 ? (acc += p[i]; n += 1); i += 1);
+  10 * log10(acc / max(n, 1) + 0.0000000000001);
+);
+
+// Statistics: cleared, a segment's average powers (and its crest, < 0 for none) added, and written out
+function tb_stats_clear() (
+  memset(TB_S1, 0, TB_PTS); memset(TB_S2, 0, TB_PTS); memset(TB_B1, 0, 4); memset(TB_B2, 0, 4);
+  TB_SN = 0; TB_C1 = TB_C2 = TB_CN = 0;
+);
+function tb_stats_add(p, crest) local(i, lk, d, b) (
+  lk = tb_klevel(p);
+  lk > TB_GATE ? (
+    i = 0;
+    loop(TB_PTS,
+      d = 10 * log10(p[i] + 0.0000000000001) - lk;
+      TB_S1[i] += d; TB_S2[i] += d * d;
+      i += 1;
+    );
+    b = 0;
+    loop(4, d = tb_bandlevel(p, b) - lk; TB_B1[b] += d; TB_B2[b] += d * d; b += 1);
+    crest > 0 ? (TB_C1 += crest; TB_C2 += crest * crest; TB_CN += 1);
+    TB_SN += 1;
+  );
+);
+// Smooth an array over +-4 points (a third of an octave), in place, through the scratch array tmp
+function tb_smooth(a, tmp) local(i, j, acc, n) (
+  i = 0;
+  loop(TB_PTS,
+    acc = 0; n = 0; j = max(i - 4, 0);
+    loop(min(i + 4, TB_PTS - 1) - j + 1, acc += a[j]; n += 1; j += 1);
+    tmp[i] = acc / n;
+    i += 1;
+  );
+  memcpy(a, tmp, TB_PTS);
+);
+function tb_stats_write(t, files, tmp) local(i, m, v) (
+  TB_SN > 0 ? (
+    i = 0;
+    loop(TB_PTS,
+      m = TB_S1[i] / TB_SN; v = TB_S2[i] / TB_SN - m * m;
+      t[TB_OM + i] = m; t[TB_OS + i] = sqrt(max(v, 0));
+      i += 1;
+    );
+    tb_smooth(t + TB_OM, tmp); tb_smooth(t + TB_OS, tmp);
+    i = 0; loop(TB_PTS, t[TB_OS + i] = max(t[TB_OS + i], 1); i += 1);
+    i = 0;
+    loop(4,
+      m = TB_B1[i] / TB_SN; v = TB_B2[i] / TB_SN - m * m;
+      t[TB_OBM + i] = m; t[TB_OBS + i] = max(sqrt(max(v, 0)), 0.75);
+      i += 1;
+    );
+    TB_CN > 0 ? (
+      m = TB_C1 / TB_CN; v = TB_C2 / TB_CN - m * m;
+      t[TB_OCM] = m; t[TB_OCS] = max(sqrt(max(v, 0)), 1);
+    ) : (t[TB_OCM] = 12; t[TB_OCS] = 3);
+    t[TB_OVALID] = 1; t[TB_OSEG] = TB_SN; t[TB_OFILES] = files;
+  );
+  TB_SN > 0;
+);
+
+/*
+ * Factory targets, drawn up here (not measured from anyone's references): typical shapes in third-octave
+ * levels. 1 Modern (pop, rock, electronic), 2 Bass Heavy, 3 Acoustic / Orchestral, 4 Pink noise.
+ */
+function tb_hp(f, fc, ord) ( -10 * log10(1 + (fc / f) ^ (2 * ord)); );
+function tb_lp(f, fc, ord) ( -10 * log10(1 + (f / fc) ^ (2 * ord)); );
+function tb_bump(f, fc, g, oct) ( g * exp(-0.5 * sqr(log(f / fc) / log(2) / oct)); );
+function tb_shape(k, f) local(o) (
+  o = log(f / 1000) / log(2);
+  k == 1 ? -1.5 * o + tb_bump(f, 65, 3, 0.9) - 1.5 * max(log(f / 5000) / log(2), 0) + tb_hp(f, 32, 4) + tb_lp(f, 17000, 4) :
+  k == 2 ? -1.5 * o + tb_bump(f, 55, 6.5, 0.95) - 2 * max(log(f / 4000) / log(2), 0) + tb_hp(f, 27, 4) + tb_lp(f, 16500, 4) :
+  k == 3 ? -2.5 * max(o + 1.7, 0) - 0.5 * min(o + 1.7, 0) + tb_hp(f, 55, 2) + tb_lp(f, 13000, 2) :
+  0;
+);
+function tb_factory(k, t) local(i, f, e, lk, b) (
+  i = 0;
+  loop(TB_PTS,
+    f = tb_freq(i);
+    TB_PTMP[i] = 10 ^ (tb_shape(k, f) / 10);
+    i += 1;
+  );
+  lk = tb_klevel(TB_PTMP);
+  b = 0; loop(4, t[TB_OBM + b] = tb_bandlevel(TB_PTMP, b) - lk; t[TB_OBS + b] = k == 4 ? 2 : 1.5; b += 1);
+  i = 0;
+  loop(TB_PTS,
+    f = tb_freq(i);
+    t[TB_OM + i] = tb_shape(k, f) - lk;
+    // Wider at the ends, where material differs most
+    e = max(log(60 / f) / log(2), 0) + max(log(f / 10000) / log(2), 0);
+    t[TB_OS + i] = (k == 4 ? 3 : 2) + 1.2 * min(e, 1.5);
+    i += 1;
+  );
+  t[TB_OCM] = k == 1 ? 9 : k == 2 ? 8 : k == 3 ? 14 : 12;
+  t[TB_OCS] = k == 3 ? 3 : 2;
+  t[TB_OVALID] = 1; t[TB_OSEG] = 0; t[TB_OFILES] = 0;
+);
+
+/*
+ * The output against the target: TB_UD the output's normalised levels, TB_DEV their difference from the
+ * target's mean (both smoothed), TB_BDEV[b] per band; TB_InBand[b] whether each band is in range
+ */
+function tb_compare(t) local(i, lk, b, d) (
+  lk = tb_klevel(TB_LIVE);
+  TB_LiveLk = lk;
+  i = 0;
+  loop(TB_PTS, TB_UD[i] = 10 * log10(TB_LIVE[i] + 0.0000000000001) - lk; i += 1);
+  tb_smooth(TB_UD, TB_SMG);
+  i = 0; loop(TB_PTS, TB_DEV[i] = TB_UD[i] - t[TB_OM + i]; i += 1);
+  b = 0;
+  loop(4,
+    d = tb_bandlevel(TB_LIVE, b) - lk - t[TB_OBM + b];
+    b == 0 ? TB_BD0 = d : b == 1 ? TB_BD1 = d : b == 2 ? TB_BD2 = d : TB_BD3 = d;
+    b += 1;
+  );
+  TB_IN0 = abs(TB_BD0) <= t[TB_OBS + 0]; TB_IN1 = abs(TB_BD1) <= t[TB_OBS + 1];
+  TB_IN2 = abs(TB_BD2) <= t[TB_OBS + 2]; TB_IN3 = abs(TB_BD3) <= t[TB_OBS + 3];
+);
+
+/*
+ * Crossovers for the band solo and the crest meter: Linkwitz-Riley (two second-order Butterworth
+ * sections), set as low or high pass
+ */
+function tb_bq(type, f, sr) instance(b0, b1, b2, a1, a2) local(w, c, s, al, n) (
+  w = 2 * $pi * min(f, sr * 0.45) / sr; c = cos(w); s = sin(w); al = s / (2 * sqrt(0.5));
+  n = 1 + al;
+  type == 0 ? (b0 = (1 - c) / 2 / n; b1 = (1 - c) / n; b2 = b0) : (b0 = (1 + c) / 2 / n; b1 = -(1 + c) / n; b2 = b0);
+  a1 = -2 * c / n; a2 = (1 - al) / n;
+);
+function tb_tick(x) instance(b0, b1, b2, a1, a2, z1, z2) local(y) (
+  y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; y;
+);
+function tb_zero() instance(z1, z2) ( z1 = z2 = 0; );
