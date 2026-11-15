@@ -1,0 +1,300 @@
+desc: ReEQ3 Clarity (adaptive unmasking)
+/*
+  ReEQ3: Clarity, an equaliser that readjusts itself all the time to reduce masking: it brings down what
+  dominates its neighbourhood and brings up what is being masked. Built from textbook psychoacoustics
+  (critical bands and a spreading function), not from anyone's proprietary model.
+
+  Analysis (every CL_H samples, about 190 times a second at 48 kHz): one complex transform of the last
+  CL_N samples (left in the real part, right in the imaginary one) gives the power of both channels in
+  31 third-octave bands. Each band's level is compared with the excitation the other bands spread onto
+  it (27 dB per Bark towards lower frequencies, 10 dB per Bark towards higher ones), relative to what a
+  flat (pink) spectrum would give:
+    - above it by more than the dead zone: dominant, Tame cuts it;
+    - below it: masked, Recover lifts it (not what lies far below the programme: noise).
+  Bias moves the frontier between both, Brighten leans the correction towards the highs or the lows,
+  Boost adds the change in balance that a change of listening level brings (equal-loudness contours),
+  and the two range limits keep Recover and Tame inside (or, crossed, outside) a range.
+
+  Processing: 31 bells (a third of an octave apart, Q 3) in series, state-variable filters whose gains
+  glide (two 25 ms smoothers in series, coefficients every 16 samples). The bells' gains are solved so
+  that their sum hits the wanted curve at every band's centre. In steady state it is a plain equaliser,
+  so it adds no distortion; while it moves, the gain changes are too slow to be heard as modulation.
+  The audio is delayed by half the analysis window so the gains arrive on time, and the K-weighted
+  loudness the curve adds or takes away is given back.
+
+  MIT License, (c) 2026 Eloy Platas.
+*/
+
+@init
+
+CL_NB = 31; CL_Q = 3;
+
+function cl_bark(f) ( 13 * atan(0.00076 * f) + 3.5 * atan(sqr(f / 7500)); );
+function cl_bell_db(f, f0, q, g) local(a, o) (
+  a = 10 ^ (g / 40); o = f / f0;
+  10 * log10((sqr(1 - o * o) + sqr(a * o / q)) / (sqr(1 - o * o) + sqr(o / (a * q))));
+);
+// K-weighting as a power gain (as in the Tonal Balance engine)
+function cl_kw(f) local(o, a, sa, q, nr, ni, dr, di, hs) (
+  o = f / 1681.97; a = 10 ^ (4 / 40); sa = sqrt(a); q = 0.7072;
+  nr = a * (1 - a * o * o); ni = a * sa / q * o; dr = a - o * o; di = sa / q * o;
+  hs = (nr * nr + ni * ni) / (dr * dr + di * di);
+  o = f / 38.135;
+  hs * o * o * o * o / (sqr(1 - o * o) + sqr(o / 0.5003));
+);
+
+function cl_alloc(mem) (
+  mem = ceil(mem / 65536) * 65536;
+  CL_FFT = mem; mem += 16384;
+  CL_WIN = mem; mem += 8192;
+  CL_RL = mem; mem += 8192; CL_RR = mem; mem += 8192;     // what is analysed
+  CL_ML = mem; mem += 8192; CL_MR = mem; mem += 8192;     // the main input, while a sidechain is analysed
+  CL_DL = mem; mem += 4096; CL_DR = mem; mem += 4096;     // the audio's delay
+  CL_FC = mem; mem += CL_NB; CL_GT = mem; mem += CL_NB;
+  CL_K0 = mem; mem += CL_NB; CL_K1 = mem; mem += CL_NB; CL_KF = mem; mem += CL_NB; CL_KS = mem; mem += CL_NB;
+  CL_P = mem; mem += CL_NB; CL_LS = mem; mem += CL_NB; CL_PM = mem; mem += CL_NB; CL_LM = mem; mem += CL_NB;
+  CL_D0 = mem; mem += CL_NB; CL_KWT = mem; mem += CL_NB; CL_BK = mem; mem += CL_NB; CL_TL = mem; mem += CL_NB;
+  CL_RW = mem; mem += CL_NB;
+  CL_T = mem; mem += CL_NB; CL_T2 = mem; mem += CL_NB; CL_G = mem; mem += CL_NB;
+  CL_G1 = mem; mem += CL_NB; CL_G2 = mem; mem += CL_NB;
+  CL_A1 = mem; mem += CL_NB; CL_A2 = mem; mem += CL_NB; CL_A3 = mem; mem += CL_NB; CL_M1 = mem; mem += CL_NB;
+  CL_I1L = mem; mem += CL_NB; CL_I2L = mem; mem += CL_NB; CL_I1R = mem; mem += CL_NB; CL_I2R = mem; mem += CL_NB;
+  CL_W = mem; mem += CL_NB * CL_NB;      // the spreading weights, onto band i from band j
+  CL_B = mem; mem += CL_NB * CL_NB;      // from wanted gains at the centres to the bells' gains
+  CL_AM = mem; mem += CL_NB * CL_NB * 2;
+  mem;
+);
+
+function cl_reset() (
+  memset(CL_RL, 0, 8192); memset(CL_RR, 0, 8192); memset(CL_ML, 0, 8192); memset(CL_MR, 0, 8192);
+  memset(CL_DL, 0, 4096); memset(CL_DR, 0, 4096);
+  memset(CL_LS, 0, CL_NB); memset(CL_LM, 0, CL_NB);
+  memset(CL_G, 0, CL_NB); memset(CL_G1, 0, CL_NB); memset(CL_G2, 0, CL_NB);
+  memset(CL_I1L, 0, CL_NB); memset(CL_I2L, 0, CL_NB); memset(CL_I1R, 0, CL_NB); memset(CL_I2R, 0, CL_NB);
+  memset(CL_M1, 0, CL_NB);
+  CL_RP = CL_DP = CL_CC = CL_HC = 0; CL_Comp = CL_Comp1 = CL_Comp2 = 0; CL_CompLin = 1; CL_CompT = 0;
+  CL_Primed = 0;
+);
+
+function cl_setup(sr) local(i, j, f, lo, hi, df, dz, s, n, r, c, p, piv, t, m) (
+  CL_SR = sr;
+  CL_N = sr > 100000 ? 8192 : sr > 50000 ? 4096 : 2048;
+  CL_H = CL_N / 8; CL_D = CL_N / 2;
+  i = 0; loop(CL_N, CL_WIN[i] = 0.5 - 0.5 * cos(2 * $pi * i / CL_N); i += 1);
+  df = sr / CL_N;
+  CL_NA = 0;
+  i = 0;
+  loop(CL_NB,
+    f = 20 * 2 ^ (i / 3);
+    CL_FC[i] = f;
+    f < 0.45 * sr ? CL_NA = i + 1;
+    CL_GT[i] = tan($pi * min(f, 0.49 * sr) / sr);
+    lo = f * 2 ^ (-1 / 6); hi = min(f * 2 ^ (1 / 6), 0.5 * sr - df);
+    CL_K0[i] = max(ceil(lo / df), 1); CL_K1[i] = min(floor(hi / df), CL_N / 2 - 1);
+    // Narrower than two bins: the density at the centre, times the width
+    CL_KF[i] = f / df; CL_KS[i] = (hi - lo) / df;
+    CL_KWT[i] = cl_kw(f);
+    CL_BK[i] = cl_bark(f);
+    // Boost: how the balance shifts per dB of level (from the equal-loudness contours, 60 to 80 phon)
+    CL_TL[i] = min(max(log(f / 1000) / log(2) / 4, -1), 1);
+    i += 1;
+  );
+  // Spreading: band j's power onto band i
+  i = 0;
+  loop(CL_NB,
+    s = 0; j = 0;
+    loop(CL_NB,
+      dz = CL_BK[i] - CL_BK[j];
+      CL_W[i * CL_NB + j] = i == j ? 0 : 10 ^ ((dz >= 0 ? -10 * dz : 27 * dz) / 10);
+      j < CL_NA ? s += CL_W[i * CL_NB + j];
+      j += 1;
+    );
+    // What a flat spectrum gives: the reference
+    CL_D0[i] = -10 * log10(s + 0.000001);
+    i += 1;
+  );
+  // The bells' interaction (dB at centre i per dB of bell j), inverted by Gauss-Jordan
+  n = CL_NA;
+  i = 0;
+  loop(n,
+    j = 0;
+    loop(n, CL_AM[i * 2 * n + j] = cl_bell_db(CL_FC[i], CL_FC[j], CL_Q, 1); CL_AM[i * 2 * n + n + j] = i == j; j += 1);
+    i += 1;
+  );
+  c = 0;
+  loop(n,
+    piv = CL_AM[c * 2 * n + c];
+    j = 0; loop(2 * n, CL_AM[c * 2 * n + j] /= piv; j += 1);
+    r = 0;
+    loop(n,
+      r != c ? (
+        m = CL_AM[r * 2 * n + c];
+        m != 0 ? (j = 0; loop(2 * n, CL_AM[r * 2 * n + j] -= m * CL_AM[c * 2 * n + j]; j += 1));
+      );
+      r += 1;
+    );
+    c += 1;
+  );
+  memset(CL_B, 0, CL_NB * CL_NB);
+  i = 0;
+  loop(n, j = 0; loop(n, CL_B[i * CL_NB + j] = CL_AM[i * 2 * n + n + j]; j += 1); i += 1);
+  // Smoothing: the levels per analysis (attack 15 ms, release 60 ms), the gains per control step (16 samples)
+  CL_LA = 1 - exp(-CL_H / (0.25 * sr)); CL_LR = 1 - exp(-CL_H / (0.25 * sr));
+  CL_GC = 1 - exp(-16 / (0.06 * sr));
+  cl_reset();
+);
+
+// The range limits' weight per band: inside lo..hi, or outside hi..lo when they are crossed (a third of
+// an octave of transition)
+function cl_range(lo, hi) local(i, o, a, b, w) (
+  i = 0;
+  loop(CL_NB,
+    o = log(CL_FC[i]) / log(2);
+    a = log(min(lo, hi)) / log(2); b = log(max(lo, hi)) / log(2);
+    w = min(max((o - a) * 3 + 0.5, 0), 1) * min(max((b - o) * 3 + 0.5, 0), 1);
+    CL_RW[i] = lo <= hi ? w : 1 - w;
+    i += 1;
+  );
+);
+
+// The band powers of a pair of rings (their last CL_N samples up to pos) into out
+function cl_levels(rl, rr, pos, out) local(i, p, k, acc, x, sc, n2, a, b) (
+  i = 0; p = pos;
+  loop(CL_N,
+    CL_FFT[2 * i] = rl[p] * CL_WIN[i]; CL_FFT[2 * i + 1] = rr[p] * CL_WIN[i];
+    p = (p + 1) & (CL_N - 1);
+    i += 1;
+  );
+  fft(CL_FFT, CL_N);
+  fft_permute(CL_FFT, CL_N);
+  // |L|^2 + |R|^2 at bin k is half of |Z(k)|^2 + |Z(N-k)|^2; Hann's power gain 0.375, one side twice
+  sc = 0.5 * 2 / (CL_N * CL_N * 0.375);
+  n2 = 2 * CL_N;
+  i = 0;
+  loop(CL_NA,
+    CL_K1[i] - CL_K0[i] >= 1 ? (
+      acc = 0; k = CL_K0[i];
+      loop(CL_K1[i] - CL_K0[i] + 1,
+        acc += sqr(CL_FFT[2 * k]) + sqr(CL_FFT[2 * k + 1]) + sqr(CL_FFT[n2 - 2 * k]) + sqr(CL_FFT[n2 - 2 * k + 1]);
+        k += 1;
+      );
+    ) : (
+      k = max(floor(CL_KF[i]), 1); x = CL_KF[i] - k;
+      a = sqr(CL_FFT[2 * k]) + sqr(CL_FFT[2 * k + 1]) + sqr(CL_FFT[n2 - 2 * k]) + sqr(CL_FFT[n2 - 2 * k + 1]);
+      k += 1;
+      b = sqr(CL_FFT[2 * k]) + sqr(CL_FFT[2 * k + 1]) + sqr(CL_FFT[n2 - 2 * k]) + sqr(CL_FFT[n2 - 2 * k + 1]);
+      acc = ((1 - x) * a + x * b) * CL_KS[i];
+    );
+    out[i] = acc * sc;
+    i += 1;
+  );
+);
+
+/*
+ * An analysis: levels, the model, the wanted curve and the bells' gains. rec and tame 0..2, bias and
+ * bright -1..1, boost in dB, sc whether a sidechain is analysed.
+ */
+function cl_analyse(rec, tame, bias, bright, boost, sc) local(i, j, a, xo, d, lv, lmax, up, dn, t, w, num, den, g, row, s, x) (
+  cl_levels(CL_RL, CL_RR, CL_RP, CL_P);
+  sc ? cl_levels(CL_ML, CL_MR, CL_RP, CL_PM);
+  lmax = 0;
+  i = 0;
+  loop(CL_NA,
+    a = CL_P[i] > CL_LS[i] ? CL_LA : CL_LR;
+    CL_Primed ? CL_LS[i] += a * (CL_P[i] - CL_LS[i]) : CL_LS[i] = CL_P[i];
+    sc ? (CL_Primed ? CL_LM[i] += a * (CL_PM[i] - CL_LM[i]) : CL_LM[i] = CL_PM[i]);
+    lmax = max(lmax, CL_LS[i]);
+    i += 1;
+  );
+  CL_Primed = 1;
+  s = 4 * bias;
+  // Each band against what the others spread onto it (relative to a flat spectrum)...
+  i = 0;
+  loop(CL_NA,
+    row = CL_W + i * CL_NB;
+    xo = 0; j = 0;
+    loop(CL_NA, xo += row[j] * CL_LS[j]; j += 1);
+    lv = CL_LS[i];
+    CL_T[i] = lv > 0.0000000001 ? 10 * log10(lv / (xo + 0.000000000001)) - CL_D0[i] : -999;
+    i += 1;
+  );
+  // ...less its local trend (about an octave and a half each way), so the overall tilt is left to Brighten
+  i = 0;
+  loop(CL_NA,
+    w = 0; t = 0; j = max(i - 4, 0);
+    loop(min(i + 4, CL_NA - 1) - j + 1, j != i && CL_T[j] > -900 ? (t += CL_T[j]; w += 1); j += 1);
+    CL_PM[i] = w > 0 ? t / w : 0;
+    i += 1;
+  );
+  i = 0;
+  loop(CL_NA,
+    lv = CL_LS[i];
+    t = 0;
+    CL_T[i] > -900 && lmax > 0.00000001 ? (
+      d = CL_T[i] - CL_PM[i];
+      // Dominant: a cut that grows with how far the band stands out, and saturates (7 dB at 100%)
+      x = max(d - 1 - s, 0);
+      dn = tame * 7 * (1 - exp(-x / 5));
+      // Masked: a lift (6 dB at most at 100%) for what is at risk of being masked; what lies far under
+      // its neighbours (12 dB and more) is inaudible or noise, and is left alone
+      x = max(s - 1 - d, 0);
+      up = rec * 6 * (1 - exp(-x / 4)) * exp(-sqr(max(x - 12, 0) / 8));
+      up *= min(max((10 * log10(lv / lmax) + 60) / 12, 0), 1);
+      up *= max(1 + bright * CL_TL[i], 0); dn *= max(1 - bright * CL_TL[i], 0);
+      t = CL_RW[i] * (up - dn);
+    );
+    CL_T2[i] = t;
+    i += 1;
+  );
+  // Brighten also leans the whole curve (up to 3 dB at the ends at 100%), scaled by how much is going on
+  i = 0; loop(CL_NA, CL_T[i] = CL_T2[i] + bright * 3 * CL_TL[i] * min(rec + tame, 1); i += 1);
+  // Across the bands: a little smoothing, then Boost's fixed shape
+  num = den = 0;
+  i = 0;
+  loop(CL_NA,
+    t = 0.7 * CL_T[i] + 0.15 * CL_T[max(i - 1, 0)] + 0.15 * CL_T[min(i + 1, CL_NA - 1)];
+    t += boost * 0.75 / (1 + (CL_FC[i] / 40) ^ 1.4);
+    t = min(max(t, -18), 18);
+    CL_T2[i] = t;
+    // The loudness the curve adds, on the processed signal's own levels
+    w = (sc ? CL_LM[i] : CL_LS[i]) * CL_KWT[i];
+    num += w * 10 ^ (t / 10); den += w;
+    i += 1;
+  );
+  CL_CompT = den > 0.000000000001 ? -10 * log10(num / den) : 0;
+  CL_CompT = min(max(CL_CompT, -18), 18);
+  // The bells that give that curve at the centres
+  i = 0;
+  loop(CL_NA,
+    row = CL_B + i * CL_NB;
+    g = 0; j = 0;
+    loop(CL_NA, g += row[j] * CL_T2[j]; j += 1);
+    CL_G[i] = min(max(g, -20), 20);
+    i += 1;
+  );
+);
+
+// Every 16 samples: the gains glide and the bells follow
+function cl_control() local(i, a, k, g, a1) (
+  i = 0;
+  loop(CL_NA,
+    CL_G1[i] += CL_GC * (CL_G[i] - CL_G1[i]);
+    CL_G2[i] += CL_GC * (CL_G1[i] - CL_G2[i]);
+    a = exp(CL_G2[i] * 0.05756462732);
+    g = CL_GT[i]; k = 1 / (CL_Q * a);
+    a1 = 1 / (1 + g * (g + k));
+    CL_A1[i] = a1; CL_A2[i] = g * a1; CL_A3[i] = g * g * a1;
+    CL_M1[i] = k * (a * a - 1);
+    i += 1;
+  );
+  CL_Comp1 += CL_GC * (CL_CompT - CL_Comp1);
+  CL_Comp2 += CL_GC * (CL_Comp1 - CL_Comp2);
+  CL_CompLin = 10 ^ (CL_Comp2 / 20);
+);
+
+// The curve in force at a frequency (dB), for drawing
+function cl_curve_db(f) local(i, acc) (
+  acc = 0; i = 0;
+  loop(CL_NA, abs(CL_G2[i]) > 0.01 ? acc += cl_bell_db(f, CL_FC[i], CL_Q, CL_G2[i]); i += 1);
+  acc;
+);

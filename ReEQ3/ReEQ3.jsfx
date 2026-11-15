@@ -1,6 +1,6 @@
 desc: ReEQ3 - Parametric Graphic Equalizer
 tags filters
-version: 3.4.0  //<--- Make sure you change VERSION below if this changes!!
+version: 3.5.0  //<--- Make sure you change VERSION below if this changes!!
 author: Eloy Platas, after ReEQ2 by Justin Johnson
 license: MIT
 
@@ -284,6 +284,9 @@ slider250:Lf_Trim=0<-20,20,0.1>-Luftikus Trim
 slider251:Tx_On=0<0,1,1{Off,On}>-Output Transformer
 slider252:Tx_Drive=0<0,36,0.1>-Transformer Drive
 slider253:Tx_Type=0<0,1,1{BBC LL/81 MSC,Neve LO1166}>-Transformer Model
+slider254:Cl_On=0<0,1,1{Off,On}>-Clarity
+slider255:Cl_Recover=0<0,200,1>-Clarity Recover
+slider256:Cl_Tame=0<0,200,1>-Clarity Tame
 
 import Dependencies/spectrum.jsfx-inc
 import Dependencies/ivantsov_filter.jsfx-inc
@@ -295,6 +298,7 @@ import Dependencies/reeq3-lp.jsfx-inc
 import Dependencies/reeq3-luftikus.jsfx-inc
 import Dependencies/reeq3-ll81.jsfx-inc
 import Dependencies/reeq3-tonal.jsfx-inc
+import Dependencies/reeq3-clarity.jsfx-inc
 
 in_pin:left input
 in_pin:right input
@@ -312,7 +316,7 @@ options:no_meter gmem=ReEQ3 maxmem=16777216
 @init
 
 // This should be the same as in the comment header
-#VERSION = "3.4.0";
+#VERSION = "3.5.0";
 
 gfx_ext_retina  = 1;
 
@@ -2579,6 +2583,10 @@ function reeq3_serialize_extra(write) (
   file_mem(0, EQM_CAP, PUB_PTS);
   file_var(0, EQM_Bands);
 );
+// ReEQ3 Clarity's settings that have no slider, from state version 115
+function cl_serialize() (
+  file_var(0, Cl_Bias); file_var(0, Cl_Bright); file_var(0, Cl_Boost); file_var(0, Cl_Lo); file_var(0, Cl_Hi); file_var(0, Cl_SC);
+);
 // ReEQ3 Tonal Balance, from state version 114
 function tb_serialize() (
   file_var(0, TB_Target); file_string(0, #TB_Name); file_var(0, TB_Avg); file_var(0, TB_View); file_var(0, TB_MBands);
@@ -3082,6 +3090,9 @@ compact_width = 0;
   // Luftikus mode
   MEMORY.index = lf_alloc(MEMORY.index);
   LF_LastKeep = -1; Lf_Live = 0;
+  // Clarity
+  MEMORY.index = cl_alloc(MEMORY.index);
+  cl_setup(srate); cl_control(); Cl_Live = 0; Cl_RLo = Cl_RHi = -1;
   // Tonal Balance
   MEMORY.index = tb_alloc(MEMORY.index);
   tb_setup(srate);
@@ -3097,6 +3108,7 @@ compact_width = 0;
   EQM_CAP = 15000000; memset(EQM_CAP, -120, PUB_PTS);
   EQM_Bands = 8;
   Ext_Src = 0; Collisions_On = 1; Grab_On = 1;
+  Cl_Bias = Cl_Bright = Cl_Boost = Cl_SC = 0; Cl_Lo = 20; Cl_Hi = 20000;
   TBT = 15010000; tb_factory(1, TBT); TB_Target = 1; #TB_Name = "Modern"; TB_Avg = 0; TB_View = 1; TB_MBands = 6;
   #Instance_Name = "";
 );
@@ -3219,6 +3231,7 @@ file_avail(handle) >= 0 ? (
       file_mem(0, Band_SpecTilt, numBands);
       reeq3_serialize_extra(0);
       version >= 114 ? (tb_serialize(); TB_Target > 0 ? tb_factory(TB_Target, TBT));
+      version >= 115 ? cl_serialize();
     ) : (
       band = 0;
       loop(numBands,
@@ -3255,7 +3268,7 @@ file_avail(handle) >= 0 ? (
   // Write mode
   // The version number should reflect the ReEQ version when the file
   // format changed.
-  version = 114;
+  version = 115;
 
   file_var(0, version);
   file_var(0, NUM_BANDS);
@@ -3288,6 +3301,7 @@ file_avail(handle) >= 0 ? (
   file_mem(0, Band_SpecTilt, NUM_BANDS);
   reeq3_serialize_extra(1);
   tb_serialize();
+  cl_serialize();
 );
 
 flag_filter_update_all();
@@ -3393,7 +3407,10 @@ la_want != la_len ? (
   memset(Dyn_LaBuf, 0, 4 * LA_MAX);
 );
 // The delay REAPER compensates: the lookahead, or the linear phase engine's latency
-lp_pdc = la_len + (LP_On ? LP_LAT : 0) + (Character > 0 && Quality ? 15 : 0);
+// ReEQ3 Clarity: its range limits, a clean start, and its delay (half its analysis window)
+Cl_Lo != Cl_RLo || Cl_Hi != Cl_RHi ? (cl_range(Cl_Lo, Cl_Hi); Cl_RLo = Cl_Lo; Cl_RHi = Cl_Hi);
+Cl_On != Cl_Live ? (cl_reset(); cl_control(); Cl_Live = Cl_On);
+lp_pdc = la_len + (LP_On ? LP_LAT : 0) + (Character > 0 && Quality ? 15 : 0) + (Cl_On ? CL_D : 0);
 lp_pdc != pdc_delay ? (pdc_delay = lp_pdc; pdc_bot_ch = 0; pdc_top_ch = 2);
 // A start or stop mustn't replay what was in the line from before
 play_state != la_play ? (
@@ -3889,6 +3906,33 @@ LP_On ? (
 // ReEQ3: Luftikus mode, after the bands (each channel on its own, as the original does)
 Lf_On && !Listen_Process ? (
   spl0 = lf_tick(spl0, 0); spl1 = lf_tick(spl1, 1);
+);
+
+// ReEQ3: Clarity, the adaptive unmasking equaliser: analysis rings, the delay, an analysis every CL_H
+// samples, the gains every 16, and its 31 bells in series on both channels
+Cl_On && !Listen_Process ? (
+  CL_RL[CL_RP] = Cl_SC ? spl2 : spl0; CL_RR[CL_RP] = Cl_SC ? spl3 : spl1;
+  Cl_SC ? (CL_ML[CL_RP] = spl0; CL_MR[CL_RP] = spl1);
+  CL_RP = (CL_RP + 1) & (CL_N - 1);
+  cl_l = CL_DL[CL_DP]; cl_r = CL_DR[CL_DP]; CL_DL[CL_DP] = spl0; CL_DR[CL_DP] = spl1;
+  (CL_DP += 1) >= CL_D ? CL_DP = 0;
+  (CL_HC += 1) >= CL_H ? (CL_HC = 0; cl_analyse(Cl_Recover * 0.01, Cl_Tame * 0.01, Cl_Bias * 0.01, Cl_Bright * 0.01, Cl_Boost, Cl_SC));
+  (CL_CC += 1) >= 16 ? (CL_CC = 0; cl_control());
+  cl_bi = 0;
+  loop(CL_NA,
+    cl_v3 = cl_l - CL_I2L[cl_bi];
+    cl_v1 = CL_A1[cl_bi] * CL_I1L[cl_bi] + CL_A2[cl_bi] * cl_v3;
+    cl_v2 = CL_I2L[cl_bi] + CL_A2[cl_bi] * CL_I1L[cl_bi] + CL_A3[cl_bi] * cl_v3;
+    CL_I1L[cl_bi] = 2 * cl_v1 - CL_I1L[cl_bi]; CL_I2L[cl_bi] = 2 * cl_v2 - CL_I2L[cl_bi];
+    cl_l += CL_M1[cl_bi] * cl_v1;
+    cl_v3 = cl_r - CL_I2R[cl_bi];
+    cl_v1 = CL_A1[cl_bi] * CL_I1R[cl_bi] + CL_A2[cl_bi] * cl_v3;
+    cl_v2 = CL_I2R[cl_bi] + CL_A2[cl_bi] * CL_I1R[cl_bi] + CL_A3[cl_bi] * cl_v3;
+    CL_I1R[cl_bi] = 2 * cl_v1 - CL_I1R[cl_bi]; CL_I2R[cl_bi] = 2 * cl_v2 - CL_I2R[cl_bi];
+    cl_r += CL_M1[cl_bi] * cl_v1;
+    cl_bi += 1;
+  );
+  spl0 = cl_l * CL_CompLin; spl1 = cl_r * CL_CompLin;
 );
 
 // ReEQ3: Character, on the equalised signal (its bias taken out by a 5Hz high pass)
@@ -5518,6 +5562,8 @@ function mouse_within_window() (
  */
 function mouse_within_panel() ( 
   // (ReEQ3: only while the panel shows, which needs a selected band)
+  ui_cl_show && !compact_width && !compact_height ?
+    (mouse_x >= ui_cl_x && mouse_x < ui_cl_x + ui_cl_w && mouse_y >= panel_y && mouse_y < panel_y + panel_h) :
   ui_tb_show && !compact_width && !compact_height ?
     (mouse_x >= ui_tb_x && mouse_x < ui_tb_x + ui_tb_w && mouse_y >= panel_y && mouse_y < panel_y + panel_h) :
   ui_lf_show && !compact_width && !compact_height ?
@@ -7235,13 +7281,19 @@ function ui_draw_top() local(s, h, y, gw, gx, aw, ax, lab) (
   // ReEQ3: Luftikus mode, lit while it runs; it opens (or closes) its panel
   ui_top_lw = ui_text_w("Luftikus") + ui_pt(16); ui_top_lx = ui_top_ix - ui_pt(8) - ui_top_lw;
   ui_top_lx > ui_pt(150) ? (
-    ui_button(ui_top_lx, y, ui_top_lw, h, "Luftikus", Lf_On ? 1 : 0) ? (ui_lf_show = !ui_lf_show; ui_lf_show ? (ui_lf_sel = selected_node; ui_tb_show = 0));
+    ui_button(ui_top_lx, y, ui_top_lw, h, "Luftikus", Lf_On ? 1 : 0) ? (ui_lf_show = !ui_lf_show; ui_lf_show ? (ui_lf_sel = selected_node; ui_tb_show = 0; ui_cl_show = 0));
     ui_lf_show && !Lf_On ? (ui_col(T_ACCENT_BORDER); gfx_roundrect(ui_top_lx, y, ui_top_lw - 1, h - 1, ui_pt(5), 1));
   );
   // ReEQ3: Tonal Balance, lit while its panel shows
   ui_top_bw = ui_text_w("Balance") + ui_pt(16); ui_top_bx = ui_top_lx - ui_pt(8) - ui_top_bw;
   ui_top_bx > ui_pt(150) ? (
-    ui_button(ui_top_bx, y, ui_top_bw, h, "Balance", ui_tb_show ? 1 : 0) ? (ui_tb_show = !ui_tb_show; ui_tb_show ? ui_lf_show = 0);
+    ui_button(ui_top_bx, y, ui_top_bw, h, "Balance", ui_tb_show ? 1 : 0) ? (ui_tb_show = !ui_tb_show; ui_tb_show ? (ui_lf_show = 0; ui_cl_show = 0));
+  );
+  // ReEQ3: Clarity, lit while it runs; it opens (or closes) its panel
+  ui_top_cw = ui_text_w("Clarity") + ui_pt(16); ui_top_cx = ui_top_bx - ui_pt(8) - ui_top_cw;
+  ui_top_cx > ui_pt(150) ? (
+    ui_button(ui_top_cx, y, ui_top_cw, h, "Clarity", Cl_On ? 1 : 0) ? (ui_cl_show = !ui_cl_show; ui_cl_show ? (ui_lf_show = 0; ui_tb_show = 0));
+    ui_cl_show && !Cl_On ? (ui_col(T_ACCENT_BORDER); gfx_roundrect(ui_top_cx, y, ui_top_cw - 1, h - 1, ui_pt(5), 1));
   );
   ui_icon_button(gx, y, gw, h, 5, ui_popup == 5 ? 1 : 0) ? (ui_popup = 5; ui_pop_skip = 1; ui_block = 1; ui_pop_x = gx; ui_pop_y = y; ui_pop_w = gw);
   gfx_setfont(FONT_BASE);
@@ -9161,6 +9213,120 @@ function ui_draw_tb_panel() local(s, x, y, w, h, hy, hh, bx, bw, k, i, cx, cw, b
 );
 
 /*
+ * ===================================================================================================
+ * ReEQ3 Clarity: its panel, its moving curve and its range limits on the graph
+ * ===================================================================================================
+ */
+function cl_knob(k, cx, cy, label, v, lo, hi, bipolar, step, rst, fmt, unit) local(t, nt, nv, hit) (
+  t = (v - lo) / (hi - lo);
+  k == 0 ? (lfd0.x = cx; lfd0.y = cy; lfd0.r = 29 * ui_pt(1); nt = ui_popup == 0 && !ui_block ? lfd0.handle_number_dial(t) : t; hit = lfd0.is_mouse_number_dial()) :
+  k == 1 ? (lfd1.x = cx; lfd1.y = cy; lfd1.r = 29 * ui_pt(1); nt = ui_popup == 0 && !ui_block ? lfd1.handle_number_dial(t) : t; hit = lfd1.is_mouse_number_dial()) :
+  k == 2 ? (lfd2.x = cx; lfd2.y = cy; lfd2.r = 29 * ui_pt(1); nt = ui_popup == 0 && !ui_block ? lfd2.handle_number_dial(t) : t; hit = lfd2.is_mouse_number_dial()) :
+  k == 3 ? (lfd3.x = cx; lfd3.y = cy; lfd3.r = 29 * ui_pt(1); nt = ui_popup == 0 && !ui_block ? lfd3.handle_number_dial(t) : t; hit = lfd3.is_mouse_number_dial()) :
+           (lfd4.x = cx; lfd4.y = cy; lfd4.r = 29 * ui_pt(1); nt = ui_popup == 0 && !ui_block ? lfd4.handle_number_dial(t) : t; hit = lfd4.is_mouse_number_dial());
+  nv = lo + nt * (hi - lo);
+  step > 0 ? nv = floor(nv / step + 0.5) * step;
+  // Double click: back to its default
+  ui_press && hit ? (
+    time_precise() - ui_cl_click_t < 0.4 && ui_cl_click_k == k ? nv = rst;
+    ui_cl_click_t = time_precise(); ui_cl_click_k = k;
+  );
+  ui_dial_accent = 1;
+  ui_dial_face(cx, cy, label, (nv - lo) / (hi - lo), bipolar, 0, !Cl_On, sprintf(#, fmt, nv), unit);
+  ui_dial_accent = 0;
+  nv;
+);
+
+function ui_draw_cl_panel() local(s, x, y, w, h, hy, hh, bx, bw, sp, cx, cy, v, tx) (
+  s = ui_pt(1);
+  w = floor(min(700 * s, gfx_w - 8 * s)); h = panel_h;
+  x = floor(gfx_w / 2 - w / 2); y = panel_y;
+  ui_cl_x = x; ui_cl_w = w;
+  ui_cola(T_PANEL, 1); ui_fill_rrect(x, y, w, h, 8 * s);
+  ui_cola(T_BORDER, 1); gfx_roundrect(x, y, w - 1, h - 1, 8 * s, 1);
+  ui_cola(T_ACCENT_BORDER, 1); gfx_line(x + 8 * s, y, x + w - 8 * s, y, 1);
+  hy = y + 6 * s; hh = 24 * s;
+  gfx_setfont(FONT_BODY_B); ui_col(T_ACCENT);
+  ui_text_l(x + 14 * s, hy, hh, "CLARITY");
+  bx = x + 14 * s + ui_text_w("CLARITY") + 12 * s;
+  gfx_setfont(FONT_BODY_B); bw = ui_text_w("Off") + 22 * s;
+  ui_button(bx, hy, bw, hh, Cl_On ? "On" : "Off", Cl_On ? 1 : 0) ? (Cl_On = !Cl_On; slider_automate(Cl_On));
+  gfx_setfont(FONT_CAP); ui_col(T_TEXT_DIM);
+  ui_text_l(bx + bw + 10 * s, hy, hh, sprintf(#, "adaptive unmasking · %d ms latency · drag the limits on the graph", floor(1000 * CL_D / srate + 0.5)));
+  ui_icon_button(x + w - 10 * s - 26 * s, hy, 26 * s, hh, 10, 0) ? ui_cl_show = 0;
+  gfx_setfont(FONT_BODY); bw = ui_text_w("Sidechain") + 18 * s; tx = x + w - 10 * s - 26 * s - 8 * s - bw;
+  ui_button(tx, hy, bw, hh, "Sidechain", Cl_SC ? 1 : 0) ? Cl_SC = !Cl_SC;
+  ui_col(T_BORDER_SUBTLE);
+  gfx_line(x + 12 * s, y + 36 * s, x + w - 12 * s, y + 36 * s, 0);
+  sp = (w - 24 * s) / 5;
+  ui_dial_hx = sp * 0.5;
+  cy = y + 91 * s; cx = x + 12 * s + sp * 0.5;
+  v = cl_knob(0, cx, cy, "RECOVER", Cl_Recover, 0, 200, 0, 1, 0, "%.0f", "%");
+  v != Cl_Recover ? (Cl_Recover = v; slider_automate(Cl_Recover));
+  cx += sp;
+  v = cl_knob(1, cx, cy, "TAME", Cl_Tame, 0, 200, 0, 1, 0, "%.0f", "%");
+  v != Cl_Tame ? (Cl_Tame = v; slider_automate(Cl_Tame));
+  cx += sp;
+  Cl_Bias = cl_knob(2, cx, cy, "BIAS", Cl_Bias, -100, 100, 1, 1, 0, "%+.0f", "%");
+  cx += sp;
+  Cl_Bright = cl_knob(3, cx, cy, "BRIGHTEN", Cl_Bright, -100, 100, 1, 1, 0, "%+.0f", "%");
+  cx += sp;
+  Cl_Boost = cl_knob(4, cx, cy, "BOOST", Cl_Boost, -12, 12, 1, 0.1, 0, "%+.1f", "dB");
+  gfx_setfont(FONT_BASE);
+);
+
+// The curve in force (it moves with the music) and the range limits, while the panel shows
+function cl_draw() local(c, f, y, ly, y0, bottom, x, i, lo, hi, a) (
+  bottom = gfx_h - BOTTOM_MARGIN - gfx_texth;
+  Cl_On ? (
+    y0 = db_to_y(0);
+    ui_col(T_CURVE_SIDE);
+    c = 0;
+    while (c < gfx_w) (
+      f = scx_to_freq(c);
+      y = min(db_to_y(cl_curve_db(f) + CL_Comp2), bottom);
+      gfx_a = 0.14; gfx_line(c, y0, c, y, 0);
+      gfx_a = 0.95; c > 0 ? ui_thick_line(c - 3, ly, c, y, ui_pt(1.5));
+      ly = y; c += 3;
+    );
+    gfx_a = 1;
+  );
+  ui_cl_show ? (
+    // The limits: a handle at the top of each; what lies outside is shaded
+    lo = freq_to_scx(min(Cl_Lo, Cl_Hi)); hi = freq_to_scx(max(Cl_Lo, Cl_Hi));
+    ui_col(T_GRAPH_SHADE); gfx_a = 0.35;
+    Cl_Lo <= Cl_Hi ? (gfx_rect(0, TOP_MARGIN, lo, bottom - TOP_MARGIN); gfx_rect(hi, TOP_MARGIN, gfx_w - hi, bottom - TOP_MARGIN))
+                   : gfx_rect(lo, TOP_MARGIN, hi - lo, bottom - TOP_MARGIN);
+    i = 0;
+    loop(2,
+      x = freq_to_scx(i == 0 ? Cl_Lo : Cl_Hi);
+      a = Cl_Drag == i + 1 || (Cl_Drag == 0 && abs(mouse_x - x) < ui_pt(5) && mouse_y > TOP_MARGIN && mouse_y < bottom);
+      ui_col(T_ACCENT); gfx_a = a ? 1 : 0.6;
+      gfx_line(x, TOP_MARGIN, x, bottom, 0);
+      gfx_rect(x - ui_pt(4), TOP_MARGIN, ui_pt(9), ui_pt(14));
+      a ? (gfx_setfont(FONT_CAP); ui_col(T_TEXT); ui_text_l(x + ui_pt(7), TOP_MARGIN, ui_pt(14),
+            sprintf(#, (i == 0 ? Cl_Lo : Cl_Hi) >= 1000 ? "%.1f kHz" : "%.0f Hz", (i == 0 ? Cl_Lo : Cl_Hi) >= 1000 ? (i == 0 ? Cl_Lo : Cl_Hi) / 1000 : (i == 0 ? Cl_Lo : Cl_Hi))));
+      i += 1;
+    );
+    gfx_a = 1;
+  );
+);
+
+// Dragging a limit (before the graph's own mouse handling); returns 1 while it has the mouse
+function cl_mouse() local(bottom, x0, x1) (
+  bottom = gfx_h - BOTTOM_MARGIN - gfx_texth;
+  ui_press && mouse_y > TOP_MARGIN && mouse_y < bottom && !mouse_within_panel() ? (
+    x0 = freq_to_scx(Cl_Lo); x1 = freq_to_scx(Cl_Hi);
+    abs(mouse_x - x0) < ui_pt(5) ? Cl_Drag = 1 : abs(mouse_x - x1) < ui_pt(5) ? Cl_Drag = 2;
+  );
+  Cl_Drag && (mouse_cap & 1) ? (
+    Cl_Drag == 1 ? Cl_Lo = min(max(scx_to_freq(mouse_x), 20), 20000) : Cl_Hi = min(max(scx_to_freq(mouse_x), 20), 20000);
+  );
+  !(mouse_cap & 1) ? Cl_Drag = 0;
+  Cl_Drag > 0;
+);
+
+/*
  * ReEQ3: the Processing popover, from the toolbar: Zero Latency or Linear Phase and its resolution, the
  * Character and its oversampling, with the latency they add
  */
@@ -10135,8 +10301,9 @@ while (
 // Right
 !tb_rm_on && drawRight ? draw_filter_response(4, T_CURVE_RIGHT);
 
-// ReEQ3: Luftikus mode's own curve
+// ReEQ3: Luftikus mode's own curve, and Clarity's
 draw_lf_curve();
+!UI_EMBED && !compact_width && !compact_height ? cl_draw();
 
 // Stereo
 !tb_rm_on ? draw_filter_response(0, T_CURVE);
@@ -10244,6 +10411,8 @@ ui_popup == 0 && !ui_block && node_drag_mode == 0 && button_focus == -1 ? (
 );
 
 do_general_mouse = ui_popup == 0 && !ui_block && !ui_chrome_press && !ui_rdrag && !ui_ddrag;
+// ReEQ3: Clarity's range limits, while its panel shows
+ui_cl_show && do_general_mouse && !compact_width && !compact_height ? (cl_mouse() ? do_general_mouse = 0);
 // ReEQ3: editing another instance, the graph's mouse is that instance's
 tb_rm_on && do_general_mouse ? (
   tb_rm_in = !mouse_within_panel() && mouse_y > HEADER_H && mouse_y < gfx_h - BOTTOM_MARGIN;
@@ -10737,6 +10906,7 @@ ui_popup == 8 && (UI_EMBED || ui_key == 27) ? ui_popup = 0;
 (ui_popup == 10 || ui_popup == 11) && (compact_height || compact_width || ui_key == 27) ? (ui_popup = 0; ui_inst_edit = 0);
 ui_popup == 0 && ui_lf_show && ui_key == 27 ? ui_lf_show = 0;
 ui_popup == 0 && ui_tb_show && ui_key == 27 ? ui_tb_show = 0;
+ui_popup == 0 && ui_cl_show && ui_key == 27 ? ui_cl_show = 0;
 // The value stepper, when its control goes away or turns inert
 ui_popup == 9 && (ui_key == 27 || !sv_live(ui_sv_id, ui_sv_b)) ? ui_popup = 0;
 
@@ -10772,6 +10942,7 @@ ui_fade > 0 ? (
   // ReEQ3: the Luftikus panel takes the band panel's place while shown; picking a band closes it
   ui_lf_show && selected_node != ui_lf_sel && selected_node != -1 ? ui_lf_show = 0;
   ui_lf_sel = selected_node;
+  ui_cl_show && !compact_width && !compact_height ? ui_draw_cl_panel() :
   ui_tb_show && !compact_width && !compact_height ? ui_draw_tb_panel() :
   ui_lf_show && !compact_width && !compact_height ? ui_draw_lf_panel() :
   ShowPanel && selected_node != -1 ? ui_draw_panel();

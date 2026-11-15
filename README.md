@@ -4,7 +4,7 @@
 
 ReEQ³ es un ecualizador paramétrico JSFX para REAPER. Parte de **ReEQ² 2.2.0** de Justin Johnson ([ReJJ](https://github.com/Justin-Johnson/ReJJ), MIT) y le añade las funciones de FabFilter Pro‑Q 4 que se pueden hacer en JSFX. Conserva todo lo de ReEQ²: 16 bandas, filtros ajustados a la curva analógica hasta Nyquist, dinámica por banda con tres sidechains, lookahead, analizador y temas.
 
-**Manual** (inglés y castellano): [ReEQ3-Manual-EN-ES.pdf](ReEQ3-Manual-EN-ES.pdf). Versión actual: **3.4.0**.
+**Manual** (inglés y castellano): [ReEQ3-Manual-EN-ES.pdf](ReEQ3-Manual-EN-ES.pdf). Versión actual: **3.5.0**.
 
 ## Instalación
 
@@ -125,6 +125,17 @@ El botón **Balance** de la cabecera abre un panel que compara la media a largo 
 - **Match to target**: 4, 6, 8 o 12 campanas que llevan la salida a la media del objetivo, con vista previa y *Apply*.
 - **Editar otra instancia**: en el selector *EQ* elige otro ReEQ³. La gráfica pasa a editar esa instancia (arrastrar nodos, rueda para la Q, clic derecho para quitar, doble clic para añadir), y *Apply* pone allí la corrección. Así se puede tener el panel en el máster y el EQ en un bus o una pista. La comunicación va por `gmem`.
 
+## Clarity
+
+![Clarity](ReEQ3-clarity.png)
+
+El botón **Clarity** de la cabecera abre un ecualizador adaptativo de desenmascarado, en la línea de Gullfoss de Soundtheory. Su algoritmo no es público, así que este es propio y está hecho con psicoacústica estándar. Reajusta continuamente una curva de EQ: baja lo que domina su entorno y sube lo que está a punto de quedar enmascarado. La curva que actúa en cada momento se dibuja en cian.
+
+- **Controles**: Recover y Tame (0–200 %), Bias y Brighten (±100 %), Boost (±12 dB, curvas de igual sonoridad), dos **límites de rango** que se arrastran en la gráfica (cruzados, excluyen el tramo entre ellos) y **Sidechain** (el análisis escucha los pines 3/4).
+- **Cómo funciona**: unas 190 veces por segundo mide 31 bandas de tercio de octava y compara cada una con la excitación que le extienden las demás (dispersión por bandas críticas), descontando su tendencia local. La curva resultante la hacen 31 campanas de variables de estado (Q 3) con las ganancias resueltas para clavarla en el centro de cada banda y deslizadas suavemente. El resultado es siempre un EQ de fase mínima, sin pre-ringing, y mantiene la sonoridad (ponderación K).
+- **Latencia**: 21 ms a 44,1 y 48 kHz (1024 muestras), compensada por REAPER.
+- **Medido**: 0,0018 % de distorsión a 1 kHz. Con ruido estable, la ganancia oscila 0,2 dB de media por banda. Con un bombo sobre un pad, las ganancias se mueven 1,3 dB como máximo. No hay sobreimpulso en los arranques. Con Clarity trabajando, la CPU sube alrededor de un 45 %.
+
 ## Valores por defecto
 
 Una instancia nueva arranca con el espectro del analizador en **Full**, los ajustes estéreo de la barra inferior en **L/R** y la inclinación del analizador a **0 dB/oct**.
@@ -132,14 +143,15 @@ Una instancia nueva arranca con el espectro del analizador en **Full**, los ajus
 ## Compatibilidad
 
 - ReEQ³ es un archivo distinto: los proyectos con ReEQ² no cambian hasta que ejecutes el script de migración.
-- Los sliders 1‑233 son los de ReEQ². ReEQ³ añade los sliders 234‑238 (Output Pan, Pan Mode, Character, Processing Mode y Linear Phase Resolution), 239‑250 (modo Luftikus) y 251‑253 (transformador de salida: encendido, drive y modelo).
-- El estado guardado es la versión 114 (añade el objetivo de Tonal Balance). Los estados de ReEQ² se cargan sin cambiar el sonido: sus campanas, shelves y tilt shelves entran a 12 dB/oct.
+- Los sliders 1‑233 son los de ReEQ². ReEQ³ añade los sliders 234‑238 (Output Pan, Pan Mode, Character, Processing Mode y Linear Phase Resolution), 239‑250 (modo Luftikus) 251‑253 (transformador de salida: encendido, drive y modelo) y 254‑256 (Clarity: encendido, Recover y Tame).
+- El estado guardado es la versión 115 (añade el objetivo de Tonal Balance y los ajustes de Clarity sin slider). Los estados de ReEQ² se cargan sin cambiar el sonido: sus campanas, shelves y tilt shelves entran a 12 dB/oct.
 
 ## Limitaciones conocidas
 
 - En fase lineal con resolución Low (un FIR de 2048 muestras) se pierde detalle por debajo de unos 60 Hz, como en cualquier EQ de fase lineal. Para cortes graves pronunciados usa High o Very High.
 - En fase lineal, el detector de una banda dinámica oye medio marco por delante, así que tiene su propio lookahead.
 - Las bandas espectrales con sidechain escuchan todas el mismo par de sidechain: el primero que se elige.
+- Clarity: Recover también sube el ruido en los pasajes tranquilos, y al 200 % la curva se mueve mucho. Compara siempre con On/Off.
 - Tonal Balance solo mide con su panel abierto (o mientras aprende), y su panel ocupa el sitio del panel de banda.
 - Al editar otra instancia se dibuja la curva de sus bandas estéreo y mid; las side, left y right se ven solo como nodos. La instancia editada tiene que estar procesando audio.
 - La lista de instancias necesita que los otros ReEQ³ estén procesando audio. Con el transporte parado muestran su último espectro durante 30 s.
