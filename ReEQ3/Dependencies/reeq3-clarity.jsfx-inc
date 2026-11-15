@@ -16,7 +16,7 @@ desc: ReEQ3 Clarity (adaptive unmasking)
   and the two range limits keep Recover and Tame inside (or, crossed, outside) a range.
 
   Processing: 31 bells (a third of an octave apart, Q 3) in series, state-variable filters whose gains
-  glide (two 25 ms smoothers in series, coefficients every 16 samples). The bells' gains are solved so
+  glide (two 35 ms smoothers in series, coefficients every 16 samples). The bells' gains are solved so
   that their sum hits the wanted curve at every band's centre. In steady state it is a plain equaliser,
   so it adds no distortion; while it moves, the gain changes are too slow to be heard as modulation.
   The audio is delayed by half the analysis window so the gains arrive on time, and the K-weighted
@@ -138,9 +138,9 @@ function cl_setup(sr) local(i, j, f, lo, hi, df, dz, s, n, r, c, p, piv, t, m) (
   memset(CL_B, 0, CL_NB * CL_NB);
   i = 0;
   loop(n, j = 0; loop(n, CL_B[i * CL_NB + j] = CL_AM[i * 2 * n + n + j]; j += 1); i += 1);
-  // Smoothing: the levels per analysis (attack 15 ms, release 60 ms), the gains per control step (16 samples)
-  CL_LA = 1 - exp(-CL_H / (0.25 * sr)); CL_LR = 1 - exp(-CL_H / (0.25 * sr));
-  CL_GC = 1 - exp(-16 / (0.06 * sr));
+  // Smoothing: the levels per analysis (80 ms up, 150 ms down), the gains per control step (16 samples)
+  CL_LA = 1 - exp(-CL_H / (0.08 * sr)); CL_LR = 1 - exp(-CL_H / (0.15 * sr));
+  CL_GC = 1 - exp(-16 / (0.035 * sr));
   cl_reset();
 );
 
@@ -232,13 +232,13 @@ function cl_analyse(rec, tame, bias, bright, boost, sc) local(i, j, a, xo, d, lv
     t = 0;
     CL_T[i] > -900 && lmax > 0.00000001 ? (
       d = CL_T[i] - CL_PM[i];
-      // Dominant: a cut that grows with how far the band stands out, and saturates (7 dB at 100%)
+      // Dominant: a cut that grows with how far the band stands out, and saturates (8.5 dB at 100%)
       x = max(d - 1 - s, 0);
-      dn = tame * 7 * (1 - exp(-x / 5));
-      // Masked: a lift (6 dB at most at 100%) for what is at risk of being masked; what lies far under
+      dn = tame * 8.5 * (1 - exp(-x / 5));
+      // Masked: a lift (7 dB at most at 100%) for what is at risk of being masked; what lies far under
       // its neighbours (12 dB and more) is inaudible or noise, and is left alone
       x = max(s - 1 - d, 0);
-      up = rec * 6 * (1 - exp(-x / 4)) * exp(-sqr(max(x - 12, 0) / 8));
+      up = rec * 7 * (1 - exp(-x / 4)) * exp(-sqr(max(x - 12, 0) / 8));
       up *= min(max((10 * log10(lv / lmax) + 60) / 12, 0), 1);
       up *= max(1 + bright * CL_TL[i], 0); dn *= max(1 - bright * CL_TL[i], 0);
       t = CL_RW[i] * (up - dn);

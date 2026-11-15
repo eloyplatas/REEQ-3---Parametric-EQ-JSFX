@@ -4,7 +4,7 @@
 
 ReEQ³ es un ecualizador paramétrico JSFX para REAPER. Parte de **ReEQ² 2.2.0** de Justin Johnson ([ReJJ](https://github.com/Justin-Johnson/ReJJ), MIT) y le añade las funciones de FabFilter Pro‑Q 4 que se pueden hacer en JSFX. Conserva todo lo de ReEQ²: 16 bandas, filtros ajustados a la curva analógica hasta Nyquist, dinámica por banda con tres sidechains, lookahead, analizador y temas.
 
-**Manual** (inglés y castellano): [ReEQ3-Manual-EN-ES.pdf](ReEQ3-Manual-EN-ES.pdf). Versión actual: **3.5.0**.
+**Manual** (inglés y castellano): [ReEQ3-Manual-EN-ES.pdf](ReEQ3-Manual-EN-ES.pdf). Versión actual: **3.6.0**.
 
 ## Instalación
 
@@ -132,9 +132,23 @@ El botón **Balance** de la cabecera abre un panel que compara la media a largo 
 El botón **Clarity** de la cabecera abre un ecualizador adaptativo de desenmascarado, en la línea de Gullfoss de Soundtheory. Su algoritmo no es público, así que este es propio y está hecho con psicoacústica estándar. Reajusta continuamente una curva de EQ: baja lo que domina su entorno y sube lo que está a punto de quedar enmascarado. La curva que actúa en cada momento se dibuja en cian.
 
 - **Controles**: Recover y Tame (0–200 %), Bias y Brighten (±100 %), Boost (±12 dB, curvas de igual sonoridad), dos **límites de rango** que se arrastran en la gráfica (cruzados, excluyen el tramo entre ellos) y **Sidechain** (el análisis escucha los pines 3/4).
-- **Cómo funciona**: unas 190 veces por segundo mide 31 bandas de tercio de octava y compara cada una con la excitación que le extienden las demás (dispersión por bandas críticas), descontando su tendencia local. La curva resultante la hacen 31 campanas de variables de estado (Q 3) con las ganancias resueltas para clavarla en el centro de cada banda y deslizadas suavemente. El resultado es siempre un EQ de fase mínima, sin pre-ringing, y mantiene la sonoridad (ponderación K).
+- **Cómo funciona**: unas 190 veces por segundo mide 31 bandas de tercio de octava y compara cada una con la excitación que le extienden las demás (dispersión por bandas críticas), descontando su tendencia local. La curva resultante la hacen 31 campanas de variables de estado (Q 3) con las ganancias resueltas para clavarla en el centro de cada banda. Los niveles siguen en 80 ms al subir y 150 ms al bajar, y las ganancias se deslizan en 35 ms. El resultado es siempre un EQ de fase mínima, sin pre-ringing, y mantiene la sonoridad (ponderación K).
 - **Latencia**: 21 ms a 44,1 y 48 kHz (1024 muestras), compensada por REAPER.
-- **Medido**: 0,0018 % de distorsión a 1 kHz. Con ruido estable, la ganancia oscila 0,2 dB de media por banda. Con un bombo sobre un pad, las ganancias se mueven 1,3 dB como máximo. No hay sobreimpulso en los arranques. Con Clarity trabajando, la CPU sube alrededor de un 45 %.
+- **Medido**: 0,0017 % de distorsión a 1 kHz. Con ruido estable, la ganancia oscila 0,3 dB de media por banda (0,9 como máximo). Con un bombo sobre un pad, las ganancias se mueven 2,2 dB como máximo. No hay sobreimpulso en los arranques. Con Clarity trabajando, la CPU sube alrededor de un 45 %.
+
+## Comparar, escuchar y vistas adicionales
+
+- **A/B**: en la cabecera, dos juegos de ajustes (bandas con su dinámica, Scale, Out y las ganancias M/L y S/R), guardados con el proyecto. *Copy* copia el juego en uso al otro y *Match* iguala la sonoridad entre los dos (reproduce antes unos segundos con cada uno).
+- **Delta**: en la barra inferior. Reproduce solo lo que cambia el EQ (la salida menos la entrada, alineadas) y no se guarda.
+- **Ayuda (?)**: al pasar el ratón por un control aparece una nota que explica qué hace.
+- **Analizador**:
+  - Espectro propio como curva o como barras de 1/3, 1/6 o 1/12 de octava.
+  - Curvas de **fase** de las bandas (discontinuas).
+  - **Goniómetro** con correlación.
+- **Instancias**:
+  - Hasta **cuatro** espectros de otras instancias a la vez, cada uno en su color y con leyenda, medidos en alta definición al tamaño de FFT del analizador. Se pueden dibujar como línea, relleno o barras.
+  - **Colisiones con acción**: arrastra en una zona roja para recortar ahí, o haz clic para −3 dB.
+  - **Amount** en EQ Match (0–100 %), que sigue escalando las bandas aplicadas hasta que las mueves.
 
 ## Valores por defecto
 
@@ -144,7 +158,7 @@ Una instancia nueva arranca con el espectro del analizador en **Full**, los ajus
 
 - ReEQ³ es un archivo distinto: los proyectos con ReEQ² no cambian hasta que ejecutes el script de migración.
 - Los sliders 1‑233 son los de ReEQ². ReEQ³ añade los sliders 234‑238 (Output Pan, Pan Mode, Character, Processing Mode y Linear Phase Resolution), 239‑250 (modo Luftikus) 251‑253 (transformador de salida: encendido, drive y modelo) y 254‑256 (Clarity: encendido, Recover y Tame).
-- El estado guardado es la versión 115 (añade el objetivo de Tonal Balance y los ajustes de Clarity sin slider). Los estados de ReEQ² se cargan sin cambiar el sonido: sus campanas, shelves y tilt shelves entran a 12 dB/oct.
+- El estado guardado es la versión 122. Carga los estados de las versiones anteriores, incluidos los de la edición con A/B, fase y goniómetro (hasta la 121). Los proyectos guardados con la 3.5.0, publicada hoy, pierden los ajustes de Clarity que no tienen slider (Bias, Brighten, Boost, rango y sidechain). Los estados de ReEQ² se cargan sin cambiar el sonido: sus campanas, shelves y tilt shelves entran a 12 dB/oct.
 
 ## Limitaciones conocidas
 

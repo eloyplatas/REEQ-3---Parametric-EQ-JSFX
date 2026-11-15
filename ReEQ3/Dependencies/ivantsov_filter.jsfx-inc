@@ -838,3 +838,69 @@ function ivf_analog_magnitude(freq)
   op_run ? m *= op.ivf_op_amag(freq);
   m;
 );
+
+/*
+ * ReEQ3: phase (radians) of the analogue prototype the design matches, for drawing, as the magnitude
+ * above: per section, the numerator's angle less the denominator's
+ */
+function ivf_sec_aph(f)
+  instance(aT, aF, aZ, aG, aO)
+  local(o, o2, r, nr, ni, dr, di)
+(
+  o = f / aF;
+  o2 = o*o;
+  aO ? (
+    aT == 1 ? -atan(o) :
+      aT == 0 ? 0.5 * $pi - atan(o) :
+        aT == 4 ? atan2(o, aG) - atan2(o, 1 / aG) :
+          aT == 3 ? atan2(o, 1 / aG) - atan2(o, aG) : 0;
+  ) : (
+    dr = 1 - o2; di = 2*aZ*o;
+    nr = 1; ni = 0;
+    aT == 0 ? (nr = -o2) :
+      aT == 2 ? (nr = dr; ni = -di) :
+        aT == 3 ? (r = sqrt(aG); dr = aG - o2; di = 2*aZ*r*o; nr = aG*(1 - aG*o2); ni = aG*di) :
+          aT == 4 ? (r = sqrt(aG); dr = 1 - aG*o2; di = 2*aZ*r*o; nr = aG*(aG - o2); ni = aG*di) :
+            aT == 5 ? (nr = 0; ni = di) :
+              aT == 6 ? (nr = dr) :
+                aT == 7 ? (nr = dr; ni = di*aG; di /= aG);
+    atan2(ni, nr) - atan2(di, dr);
+  );
+);
+
+function ivf_op_aph(f)
+  instance(aT, aF)
+  local(o)
+(
+  o = f / aF;
+  aT == 1 ? -atan(o) : 0.5 * $pi - atan(o);
+);
+
+function ivf_analog_phase(freq)
+  instance(n_run, op_run, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15, s16, s17, s18, s19, s20, op)
+  local(p)
+(
+  p = 0;
+  n_run > 0 ? p += s1.ivf_sec_aph(freq);
+  n_run > 1 ? p += s2.ivf_sec_aph(freq);
+  n_run > 2 ? p += s3.ivf_sec_aph(freq);
+  n_run > 3 ? p += s4.ivf_sec_aph(freq);
+  n_run > 4 ? p += s5.ivf_sec_aph(freq);
+  n_run > 5 ? p += s6.ivf_sec_aph(freq);
+  n_run > 6 ? p += s7.ivf_sec_aph(freq);
+  n_run > 7 ? p += s8.ivf_sec_aph(freq);
+  n_run > 8 ? p += s9.ivf_sec_aph(freq);
+  n_run > 9 ? p += s10.ivf_sec_aph(freq);
+  n_run > 10 ? p += s11.ivf_sec_aph(freq);
+  n_run > 11 ? p += s12.ivf_sec_aph(freq);
+  n_run > 12 ? p += s13.ivf_sec_aph(freq);
+  n_run > 13 ? p += s14.ivf_sec_aph(freq);
+  n_run > 14 ? p += s15.ivf_sec_aph(freq);
+  n_run > 15 ? p += s16.ivf_sec_aph(freq);
+  n_run > 16 ? p += s17.ivf_sec_aph(freq);
+  n_run > 17 ? p += s18.ivf_sec_aph(freq);
+  n_run > 18 ? p += s19.ivf_sec_aph(freq);
+  n_run > 19 ? p += s20.ivf_sec_aph(freq);
+  op_run ? p += op.ivf_op_aph(freq);
+  p;
+);

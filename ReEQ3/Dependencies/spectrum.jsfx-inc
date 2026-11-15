@@ -514,7 +514,7 @@ function spectrum.draw_line(x1, y1, x2, y2)
  */
 function spectrum.draw(bufindex)
   local(i, pwr, windowpos, dwindowpos, buf1, buf2, buf3, nb, mag, freq, rate_over_fftsize, ncol, lev, x, x2, v,
-        p0, p2, p3, c, c1, sg, r, g, b, a, time, delta, yb, pk, spectrum_fill, bottom, top, span, y, ly, ty, last)
+        p0, p2, p3, c, c1, sg, r, g, b, a, time, delta, yb, pk, spectrum_fill, bottom, top, span, y, ly, ty, last, lv)
 (
   // Select buffer to draw
   bufindex == 0 ? ( 
@@ -702,6 +702,32 @@ function spectrum.draw(bufindex)
   bottom = gfx_h - spectrum.bottom_margin - gfx_texth;
   top = spectrum.top_margin;
 
+  // ReEQ3 bars (spectrum.bars: 3, 6 or 12 per octave) for this instance's own output (buffers 0 and
+  // 1): each band's loudest column, a translucent body (its strength as the display style's) under a
+  // solid top. They stand in for the fill and the line; the peaks still draw.
+  spectrum.bars > 0 && bufindex <= 1 && spectrum_fill != 3 ? (
+    span = max(bottom - top, 1);
+    ty = max(floor(gfx_w / 1000), 1) + 0.5;
+    v = ceil(spectrum.bars * log(spectrum.min_freq / 1000) / log(2));
+    while ((sg = 1000 * 2 ^ ((v - 0.5) / spectrum.bars)) < min(srate * 0.5, spectrum.max_freq)) (
+      x = max(floor(spectrum.freq_to_x(sg)), 0);
+      x2 = min(floor(spectrum.freq_to_x(1000 * 2 ^ ((v + 0.5) / spectrum.bars))), last + 1);
+      x2 > x ? (
+        lv = 0; c = x;
+        loop(x2 - x, lv = max(lv, yb[c]); c += 1);
+        y = floor(min(spectrum.01_to_y(lv), bottom));
+        y < bottom ? (
+          gfx_r = r; gfx_g = g; gfx_b = b;
+          gfx_a = a * (spectrum_fill ? 0.35 : 0.2) * (0.4 + 0.6 * (bottom - y) / span);
+          gfx_rect(x + 1, y, max(x2 - x - 1, 1), bottom - y);
+          gfx_a = a; gfx_rect(x + 1, y, max(x2 - x - 1, 1), min(floor(ty), bottom - y));
+        );
+      );
+      v += 1;
+    );
+    spectrum_fill = 4;
+  );
+
   // Heat (fill 2): a fill under the spectrum line like Fill, each column coloured by its level, from
   // heat_r0/g0/b0 for quiet energy to the spectrum's colour where it's loud, fading towards the floor
   spectrum_fill == 2 ? (
@@ -780,16 +806,18 @@ function spectrum.draw(bufindex)
   ) : (
     gfx_r = r; gfx_g = g; gfx_b = b; gfx_a = a;
   );
-  ly = min(spectrum.01_to_y(yb[0]), bottom);
-  c = 1;
-  loop(last,
-    ty = min(spectrum.01_to_y(yb[c]), bottom);
-    ly < bottom - 1 || ty < bottom - 1 ? spectrum.draw_line(c - 1, ly, c, ty);
-    ly = ty;
-    c += 1;
+  spectrum_fill != 4 ? (
+    ly = min(spectrum.01_to_y(yb[0]), bottom);
+    c = 1;
+    loop(last,
+      ty = min(spectrum.01_to_y(yb[c]), bottom);
+      ly < bottom - 1 || ty < bottom - 1 ? spectrum.draw_line(c - 1, ly, c, ty);
+      ly = ty;
+      c += 1;
+    );
+    // Ending at Nyquist, inside the graph: drop to the floor rather than stop in mid air
+    last < ncol - 1 && ly < bottom - 1 ? spectrum.draw_line(last, ly, last, bottom);
   );
-  // Ending at Nyquist, inside the graph: drop to the floor rather than stop in mid air
-  last < ncol - 1 && ly < bottom - 1 ? spectrum.draw_line(last, ly, last, bottom);
 
   spectrum.show_peaks ? (
     gfx_r = gfx_g = gfx_b = 0.8; gfx_a = 0.35;
