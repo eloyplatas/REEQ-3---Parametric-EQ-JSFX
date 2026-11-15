@@ -4,7 +4,7 @@
 
 ReEQ³ es un ecualizador paramétrico JSFX para REAPER. Parte de **ReEQ² 2.2.0** de Justin Johnson ([ReJJ](https://github.com/Justin-Johnson/ReJJ), MIT) y le añade las funciones de FabFilter Pro‑Q 4 que se pueden hacer en JSFX. Conserva todo lo de ReEQ²: 16 bandas, filtros ajustados a la curva analógica hasta Nyquist, dinámica por banda con tres sidechains, lookahead, analizador y temas.
 
-**Manual** (inglés y castellano): [ReEQ3-Manual-EN-ES.pdf](ReEQ3-Manual-EN-ES.pdf). Versión actual: **3.6.0**.
+**Manual** (inglés y castellano): [ReEQ3-Manual-EN-ES.pdf](ReEQ3-Manual-EN-ES.pdf). Versión actual: **3.7.0**.
 
 ## Instalación
 
@@ -44,7 +44,7 @@ Todos los diseños corren sobre el motor de ReEQ², ampliado a 20 secciones por 
   - A 88,2 kHz o más, el marco se duplica, con un máximo de 16384 muestras.
   - REAPER compensa la latencia.
 - **Character**: Clean / Subtle / Warm. Es una saturación asimétrica con pendiente unidad en cero, así que el material suave pasa limpio. El sesgo de continua se elimina.
-- **Oversample 2×**: es el antiguo slider *Quality* de ReEQ². Añade 15 muestras de latencia.
+- **Oversample** (Off / 2× / 4×): para las dos etapas que crean frecuencias nuevas, Character y el transformador de salida, de modo que sus armónicos no se pliegan (aliasing). Cada etapa en uso añade 31 muestras de latencia a 2× y 37 a 4×.
 
 ### Dinámica
 
@@ -119,7 +119,8 @@ El botón **Balance** de la cabecera abre un panel que compara la media a largo 
 - **Crest factor del grave** (pico/RMS por debajo de 250 Hz) frente al margen del objetivo.
 - **Objetivos**:
   - Cuatro formas de fábrica (Modern, Bass Heavy, Acoustic / Orchestral y Pink noise). Son formas dibujadas, no medidas.
-  - Arrastra **archivos de audio** a la ventana para construir un objetivo con ellos: segmentos de 3 s, media y dispersión. WAV siempre; otros formatos si REAPER los decodifica en JSFX.
+  - Nueve **estilos** (Pop, Rock, Electronic, Hip-hop, Jazz, Folk, Disco, RnB y Soul) con las pendientes medidas por género en Pestana et al., *Spectral characteristics of popular commercial recordings 1950-2010* (AES 2013, 772 números uno).
+  - Arrastra **archivos de audio** a la ventana (hasta 512 de una vez; con la opción del menú, los siguientes se suman al mismo objetivo) para construir un objetivo con ellos: segmentos de 3 s, media y dispersión. WAV siempre; otros formatos si REAPER los decodifica en JSFX.
   - **Aprende** de la entrada, de la salida o del sidechain mientras suena.
   - **Biblioteca**: la acción `ReEQ3 Save Tonal Target.lua` guarda el objetivo en `REAPER/Data/ReEQ3/Targets` y aparece en el menú de todas las instancias. Un `.txt` de objetivo arrastrado a la ventana también se carga.
 - **Match to target**: 4, 6, 8 o 12 campanas que llevan la salida a la media del objetivo, con vista previa y *Apply*.
@@ -131,14 +132,16 @@ El botón **Balance** de la cabecera abre un panel que compara la media a largo 
 
 El botón **Clarity** de la cabecera abre un ecualizador adaptativo de desenmascarado, en la línea de Gullfoss de Soundtheory. Su algoritmo no es público, así que este es propio y está hecho con psicoacústica estándar. Reajusta continuamente una curva de EQ: baja lo que domina su entorno y sube lo que está a punto de quedar enmascarado. La curva que actúa en cada momento se dibuja en cian.
 
-- **Controles**: Recover y Tame (0–200 %), Bias y Brighten (±100 %), Boost (±12 dB, curvas de igual sonoridad), dos **límites de rango** que se arrastran en la gráfica (cruzados, excluyen el tramo entre ellos) y **Sidechain** (el análisis escucha los pines 3/4).
-- **Cómo funciona**: unas 190 veces por segundo mide 31 bandas de tercio de octava y compara cada una con la excitación que le extienden las demás (dispersión por bandas críticas), descontando su tendencia local. La curva resultante la hacen 31 campanas de variables de estado (Q 3) con las ganancias resueltas para clavarla en el centro de cada banda. Los niveles siguen en 80 ms al subir y 150 ms al bajar, y las ganancias se deslizan en 35 ms. El resultado es siempre un EQ de fase mínima, sin pre-ringing, y mantiene la sonoridad (ponderación K).
-- **Latencia**: 21 ms a 44,1 y 48 kHz (1024 muestras), compensada por REAPER.
-- **Medido**: 0,0017 % de distorsión a 1 kHz. Con ruido estable, la ganancia oscila 0,3 dB de media por banda (0,9 como máximo). Con un bombo sobre un pad, las ganancias se mueven 2,2 dB como máximo. No hay sobreimpulso en los arranques. Con Clarity trabajando, la CPU sube alrededor de un 45 %.
+- **Controles**: Recover y Tame (0–200 %), Bias y Brighten (±100 %), Boost (±12 dB), dos **límites de rango** que se arrastran en la gráfica, **Sidechain** (pines 3/4) y tres **velocidades**: Slow, Medium y Fast.
+- **Fase lineal (desde la 3.7)**: la curva la aplica un filtro de fase lineal variable en el tiempo, por solapamiento y suma con ventana. Todos los filtros tienen el mismo retardo puro, así que mientras la curva se mueve cambian niveles, nunca la fase. Antes eran campanas de fase mínima en movimiento, y de ahí venían el flanger y la suciedad con ajustes altos.
+- **Latencia**: 43 ms a 44,1 y 48 kHz (2048 muestras), compensada por REAPER.
+- **Medido**: el vaivén de fase de un tono fijo mientras la curva se mueve al 200 % baja de 9,5° rms a 0,25° rms. Distorsión por debajo de 0,00001 %. La CPU añadida baja del 45 % al 13 %.
 
 ## Comparar, escuchar y vistas adicionales
 
 - **A/B**: en la cabecera, dos juegos de ajustes (bandas con su dinámica, Scale, Out y las ganancias M/L y S/R), guardados con el proyecto. *Copy* copia el juego en uso al otro y *Match* iguala la sonoridad entre los dos (reproduce antes unos segundos con cada uno).
+- **Mix** (barra inferior, automatizable): cuánto del procesado se aplica, de 0 a 100 %, en todo el plugin y sin problemas de fase. Las bandas, Luftikus y Clarity se escalan (un corte pasa a ser un shelf), y Character y el transformador se mezclan con su propia entrada alineada. Nada hace filtro de peine.
+- **Bypass** (barra inferior, automatizable): reproduce la entrada con un fundido de 20 ms y la misma latencia, sin chasquidos ni saltos.
 - **Delta**: en la barra inferior. Reproduce solo lo que cambia el EQ (la salida menos la entrada, alineadas) y no se guarda.
 - **Ayuda (?)**: al pasar el ratón por un control aparece una nota que explica qué hace.
 - **Analizador**:
@@ -157,8 +160,9 @@ Una instancia nueva arranca con el espectro del analizador en **Full**, los ajus
 ## Compatibilidad
 
 - ReEQ³ es un archivo distinto: los proyectos con ReEQ² no cambian hasta que ejecutes el script de migración.
+- Desde la 3.7, los sliders 9 y 10 son **Mix** y **Bypass**. El techo y el suelo del analizador, que estaban ahí, pasan al estado guardado, y los proyectos anteriores se convierten al cargar.
 - Los sliders 1‑233 son los de ReEQ². ReEQ³ añade los sliders 234‑238 (Output Pan, Pan Mode, Character, Processing Mode y Linear Phase Resolution), 239‑250 (modo Luftikus) 251‑253 (transformador de salida: encendido, drive y modelo) y 254‑256 (Clarity: encendido, Recover y Tame).
-- El estado guardado es la versión 122. Carga los estados de las versiones anteriores, incluidos los de la edición con A/B, fase y goniómetro (hasta la 121). Los proyectos guardados con la 3.5.0, publicada hoy, pierden los ajustes de Clarity que no tienen slider (Bias, Brighten, Boost, rango y sidechain). Los estados de ReEQ² se cargan sin cambiar el sonido: sus campanas, shelves y tilt shelves entran a 12 dB/oct.
+- El estado guardado es la versión 123. Carga los estados de todas las versiones anteriores, incluidos los de la edición con A/B, fase y goniómetro.
 
 ## Limitaciones conocidas
 

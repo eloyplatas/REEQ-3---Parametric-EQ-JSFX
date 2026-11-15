@@ -172,13 +172,26 @@ function tb_stats_write(t, files, tmp) local(i, m, v) (
 
 /*
  * Factory targets, drawn up here (not measured from anyone's references): typical shapes in third-octave
- * levels. 1 Modern (pop, rock, electronic), 2 Bass Heavy, 3 Acoustic / Orchestral, 4 Pink noise.
+ * levels. 1 Modern (pop, rock, electronic), 2 Bass Heavy, 3 Acoustic / Orchestral, 4 Pink noise; 5 to 13
+ * the styles after Pestana et al. (Pop, Rock, Electronic, Hip-hop, Jazz, Folk, Disco, R&B, Soul).
  */
 function tb_hp(f, fc, ord) ( -10 * log10(1 + (fc / f) ^ (2 * ord)); );
 function tb_lp(f, fc, ord) ( -10 * log10(1 + (f / fc) ^ (2 * ord)); );
 function tb_bump(f, fc, g, oct) ( g * exp(-0.5 * sqr(log(f / fc) / log(2) / oct)); );
+// A style after Pestana, Ma, Reiss, Barbosa and Black, "Spectral characteristics of popular commercial
+// recordings 1950-2010" (AES 135, 2013; 772 number-one singles): the spectral slope of its Table 2 per
+// genre (a log-log fit from 100 Hz to 10 kHz of the FFT magnitude; times 6.02 it is dB per octave, and
+// 3.01 dB per octave less steep in third-octave levels), steeper above 4 kHz and cut below about 60 Hz
+// as the paper describes. The low cut's corner and the bass bump are estimates from its remarks on genres.
+function tb_style(f, slope, hpf, bump) (
+  (6.02 * slope + 3.01) * log(max(f, 100) / 1000) / log(2) - 2 * max(log(f / 4000) / log(2), 0)
+    + tb_hp(f, hpf, 2) + tb_bump(f, 60, bump, 0.9) + tb_lp(f, 16000, 3);
+);
 function tb_shape(k, f) local(o) (
   o = log(f / 1000) / log(2);
+  k == 5 ? tb_style(f, -0.9433, 50, 1) : k == 6 ? tb_style(f, -0.9793, 50, 1) : k == 7 ? tb_style(f, -0.7461, 35, 3) :
+  k == 8 ? tb_style(f, -0.8141, 35, 4) : k == 9 ? tb_style(f, -1.2929, 60, 0) : k == 10 ? tb_style(f, -1.1824, 60, 0) :
+  k == 11 ? tb_style(f, -0.8042, 45, 2) : k == 12 ? tb_style(f, -1.0336, 55, 0) : k == 13 ? tb_style(f, -1.0303, 55, 0) :
   k == 1 ? -1.5 * o + tb_bump(f, 65, 3, 0.9) - 1.5 * max(log(f / 5000) / log(2), 0) + tb_hp(f, 32, 4) + tb_lp(f, 17000, 4) :
   k == 2 ? -1.5 * o + tb_bump(f, 55, 6.5, 0.95) - 2 * max(log(f / 4000) / log(2), 0) + tb_hp(f, 27, 4) + tb_lp(f, 16500, 4) :
   k == 3 ? -2.5 * max(o + 1.7, 0) - 0.5 * min(o + 1.7, 0) + tb_hp(f, 55, 2) + tb_lp(f, 13000, 2) :
@@ -199,11 +212,11 @@ function tb_factory(k, t) local(i, f, e, lk, b) (
     t[TB_OM + i] = tb_shape(k, f) - lk;
     // Wider at the ends, where material differs most
     e = max(log(60 / f) / log(2), 0) + max(log(f / 10000) / log(2), 0);
-    t[TB_OS + i] = (k == 4 ? 3 : 2) + 1.2 * min(e, 1.5);
+    t[TB_OS + i] = (k == 4 ? 3 : k >= 5 ? 2.5 : 2) + 1.2 * min(e, 1.5);
     i += 1;
   );
-  t[TB_OCM] = k == 1 ? 9 : k == 2 ? 8 : k == 3 ? 14 : 12;
-  t[TB_OCS] = k == 3 ? 3 : 2;
+  t[TB_OCM] = k == 1 ? 9 : k == 2 ? 8 : k == 3 ? 14 : k == 4 ? 12 : k == 7 || k == 8 ? 8 : k == 9 || k == 10 ? 13 : 10;
+  t[TB_OCS] = k == 3 || k == 9 || k == 10 ? 3 : 2;
   t[TB_OVALID] = 1; t[TB_OSEG] = 0; t[TB_OFILES] = 0;
 );
 

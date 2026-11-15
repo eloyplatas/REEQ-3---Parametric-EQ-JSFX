@@ -1,0 +1,82 @@
+desc: ReEQ3 oversampling for the nonlinear stages
+/*
+  ReEQ3: 2x and 4x oversampling for Character and the output transformer, the only parts that make
+  new frequencies (the equaliser's filters already match their analogue curves up to Nyquist). Half-band
+  FIRs (windowed sinc, Kaiser beta 8): 63 taps from the host rate to 2x, 25 from 2x to 4x, polyphase
+  both ways. Flat within 0.05 dB to 20 kHz at 44.1 kHz and up, more than 90 dB down where images
+  would fold back. Latency: 31 samples at 2x, 37 at 4x, whole samples so a dry signal lines up exactly.
+
+  MIT License, (c) 2026 Eloy Platas.
+*/
+
+@init
+
+// The modified Bessel function I0, by its series
+function os_i0(x) local(s, t, k) (
+  s = t = 1; k = 1;
+  loop(30, t *= sqr(x / (2 * k)); s += t; k += 1);
+  s;
+);
+function os_halfband(fir, taps) local(i, c, x, w, r) (
+  c = (taps - 1) / 2;
+  i = 0;
+  loop(taps,
+    x = i - c;
+    r = x / c;
+    w = os_i0(8 * sqrt(max(1 - r * r, 0))) / os_i0(8);
+    fir[i] = (x == 0 ? 0.5 : sin($pi * x * 0.5) / ($pi * x)) * w;
+    i += 1;
+  );
+);
+
+function os_alloc(mem) (
+  OS_F1 = mem; mem += 64; OS_T1 = 63;
+  OS_F2 = mem; mem += 32; OS_T2 = 25;
+  os_halfband(OS_F1, OS_T1); os_halfband(OS_F2, OS_T2);
+  OS_MEM = mem; mem += 16 * 192;
+  mem;
+);
+
+/*
+ * A stage's history: its own 192 words of OS_MEM (k: 0..15). A half-band filter's taps are zero at every
+ * other place apart from its centre (0.5), so only half of them are multiplied: the taps that count are
+ * kept doubled in fe (for going up), and the histories are rings written twice (so a run of them never
+ * wraps): ha for the samples in, or the older of each pair coming down, hb for the newer of each pair.
+ */
+function os_bind(k, fir, taps) instance(ha, hb, fe, f, t, c, par, nz, len, p, dly) local(i) (
+  ha = OS_MEM + k * 192; hb = ha + 64; fe = ha + 128; f = fir; t = taps;
+  c = (taps - 1) / 2; par = c & 1; len = 32; p = 0;
+  // The taps that count: the even ones when the centre is odd, the odd ones when it is even
+  nz = par ? (taps + 1) / 2 : (taps - 1) / 2;
+  i = 0; loop(nz, fe[i] = 2 * fir[par ? 2 * i : 2 * i + 1]; i += 1);
+  dly = par ? (c - 1) / 2 : c / 2;
+  memset(ha, 0, 128);
+);
+function os_clear() instance(ha) ( memset(ha, 0, 128); );
+
+// Up: one sample in, two out (y0 then y1)
+function os_up(x) instance(ha, fe, par, nz, len, p, dly, y0, y1) local(i, a, h) (
+  p = p == 0 ? len - 1 : p - 1;
+  ha[p] = ha[p + len] = x;
+  h = ha + p;
+  a = 0; i = 0;
+  loop(nz, a += fe[i] * h[i]; i += 1);
+  par ? (y0 = a; y1 = h[dly]) : (y0 = h[dly]; y1 = a);
+);
+
+// Down: two samples in (older a, newer b), one out
+function os_down(a, b) instance(ha, hb, fe, par, nz, len, p, c) local(i, o, h) (
+  p = p == 0 ? len - 1 : p - 1;
+  ha[p] = ha[p + len] = a; hb[p] = hb[p + len] = b;
+  o = 0; i = 0;
+  par ? (
+    h = ha + p; loop(nz, o += fe[i] * h[i]; i += 1);
+    0.5 * (o + hb[p + (c + 1) / 2]);
+  ) : (
+    h = hb + p + 1; loop(nz, o += fe[i] * h[i]; i += 1);
+    0.5 * (o + ha[p + c / 2]);
+  );
+);
+
+// The latency of a factor (0 none, 1 2x, 2 4x), in host samples
+function os_latency(q) ( q == 0 ? 0 : q == 1 ? (OS_T1 - 1) / 2 : (OS_T1 - 1) / 2 + (OS_T2 - 1) / 4; );

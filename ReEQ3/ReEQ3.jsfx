@@ -1,11 +1,11 @@
 desc: ReEQ3 - Parametric Graphic Equalizer
 tags filters
-version: 3.6.0  //<--- Make sure you change VERSION below if this changes!!
+version: 3.7.0  //<--- Make sure you change VERSION below if this changes!!
 author: Eloy Platas, after ReEQ2 by Justin Johnson
 license: MIT
 
 slider1:Stereo_Mode=1<0,1,1{Mid/Side,Left/Right}>-Stereo Mode
-slider2:Quality=1<0,1,1{Eco,HQ}>-Quality
+slider2:Quality=1<0,2,1{Off,2x,4x}>-Oversampling
 slider3:Gain=0<-136,30,0.01>-Gain
 slider136:InGain=0<-136,30,0.01>-Input Gain
 slider4:MLGain=0<-136,30,0.01>-Mid/Left Gain
@@ -14,8 +14,8 @@ slider6:Scale=100<0,200,0.01>-Scale
 
 slider7:Spectrum_Mode=0<0,6,1{Full,Mid,Side,Mid / Side,Left,Right,Left / Right}>-Spectrum
 slider8:Display_Mode=0<0,3,1{Fill,Line,None,Heat}>-Display
-slider9:Ceiling_Value=0<0,2,1{0dB,20dB,40dB}>-Ceiling
-slider10:Floor_Value=0<0,2,1{-90dB,-140dB,-200dB}>-Floor
+slider9:Mix_Value=100<0,100,0.1>-Mix
+slider10:Bypass_Value=0<0,1,1{Off,On}>-Bypass
 slider11:Tilt_Value=0<0,4,1{0dB/oct,1.5dB/oct,3dB/oct,4.5dB/oct,6dB/oct}>-Tilt
 slider12:Type_Value=1<0,3,1{Hamming,Blackman-Harris,Blackman,Rectangular}>-Type
 slider13:Block_Value=2<0,3,1{2048,4096,8192,16384}>-Block Size
@@ -299,6 +299,7 @@ import Dependencies/reeq3-luftikus.jsfx-inc
 import Dependencies/reeq3-ll81.jsfx-inc
 import Dependencies/reeq3-tonal.jsfx-inc
 import Dependencies/reeq3-clarity.jsfx-inc
+import Dependencies/reeq3-os.jsfx-inc
 
 in_pin:left input
 in_pin:right input
@@ -316,7 +317,7 @@ options:no_meter gmem=ReEQ3 maxmem=16777216
 @init
 
 // This should be the same as in the comment header
-#VERSION = "3.6.0";
+#VERSION = "3.7.0";
 
 gfx_ext_retina  = 1;
 
@@ -960,10 +961,29 @@ function band_set_enabled(e)
 /*
  * Set the filter
  */
+/*
+ * ReEQ3 Mix: below 100 % the bands that have no gain become what a dry/wet blend of them would sound
+ * like without its phase trouble: a cut becomes a shelf of the cut's slope down to the blend's floor,
+ * a notch a bell that deep. (Bands with gain are scaled with Scale, so they need nothing here.)
+ */
+function mix_morph(t, g, qval, slope) (
+  MM_T = t; MM_G = g; MM_Q = qval; MM_S = slope;
+  MixK < 0.9995 ? (
+    t == FILTER_LOW_CUT || t == FILTER_LOW_CUT_BUTTERWORTH || t == FILTER_LOW_CUT_ANALOG ? (
+      MM_T = FILTER_LOW_SHELF; MM_G = 20 * log10(max(1 - MixK, 0.001)); MM_Q = 0.7071; MM_S = min(slope, 15);
+    ) : t == FILTER_HIGH_CUT || t == FILTER_HIGH_CUT_BUTTERWORTH || t == FILTER_HIGH_CUT_ANALOG ? (
+      MM_T = FILTER_HIGH_SHELF; MM_G = 20 * log10(max(1 - MixK, 0.001)); MM_Q = 0.7071; MM_S = min(slope, 15);
+    ) : t == FILTER_NOTCH ? (
+      MM_T = FILTER_PEAK; MM_G = 20 * log10(max(1 - MixK, 0.001)); MM_S = 1;
+    );
+  );
+);
+
 function band_set_filter(t, f, g, qval, slope)
   instance (enabled, type, frequency, gain, q, filter, color) (
   type = t; frequency = f; gain = g; q = qval;
-  filter.ri_config(t, f, g, qval, slope, 0);
+  mix_morph(t, g, qval, slope);
+  filter.ri_config(MM_T, f, MM_G, MM_Q, MM_S, 0);
 );
 
 /*
@@ -979,12 +999,14 @@ function band_set_filter(t, f, g, qval, slope)
 function band_set_visual(t,f,g,qval,slope)
   instance(type,frequency,gain,q,filter)(
   type=t;frequency=f;gain=g;q=qval;
-  ri_recipe(filter.plan,t,f,qval,g,slope,0);filter.ri_prepare_visual();
+  mix_morph(t, g, qval, slope);
+  ri_recipe(filter.plan,MM_T,f,MM_Q,MM_G,MM_S,0);filter.ri_prepare_visual();
 );
 function band_set_meter(t,f,g,qval,slope)
   instance(type,frequency,gain,q,filter)(
   type=t;frequency=f;gain=g;q=qval;
-  ri_recipe(filter.plan,t,f,qval,g,slope,0);AF_meter.ri_compute(filter.plan,-1,1);
+  mix_morph(t, g, qval, slope);
+  ri_recipe(filter.plan,MM_T,f,MM_Q,MM_G,MM_S,0);AF_meter.ri_compute(filter.plan,-1,1);
 );
 function band_dyn_section(t, f, qval, db)
   instance (filter, dslope) (
@@ -1848,7 +1870,7 @@ function band_gfx_due(b) local(g) (
 );
 
 function update_visual_filters() local (band_scalar) (
-  band_scalar = Scale / 100.0;
+  band_scalar = Scale / 100.0 * MixK;
 
   band_gfx_due(0) ? (Band_GfxUpdate[0] = 0; gfx_band1.band_set_visual(Band_Type[0], Band_Frequency[0], Band_GfxGain[0] * band_scalar, band_q_eff(0, Band_GfxGain[0] * band_scalar), Band_Slope[0]);  );
   band_gfx_due(1) ? (Band_GfxUpdate[1] = 0; gfx_band2.band_set_visual(Band_Type[1], Band_Frequency[1], Band_GfxGain[1] * band_scalar, band_q_eff(1, Band_GfxGain[1] * band_scalar), Band_Slope[1]);  );
@@ -1869,7 +1891,7 @@ function update_visual_filters() local (band_scalar) (
 );
 
 function update_audio_filters() local (band_scalar) (
-  band_scalar = Scale / 100.0;
+  band_scalar = Scale / 100.0 * MixK;
 
   Band_Update[0] && (Band_Dyn_On[0] || AF_Clock>=AF_Due[0]) ? (AF_Due[0]=AF_Clock+32; Band_Update[0] = 0; Band_Enabled[0] != BAND_STATE_ENABLED ? band1.band_off() :
     Band_Dyn_On[0] && band_dyn_capable(Band_Type[0]) ? band1.band_dyn_set_filter(0, band_scalar) :
@@ -1964,7 +1986,7 @@ function ag_init_weights() local(i, w) (
 function ag_measure(b) instance(filter) local(i, m, p) (
   p = AG_Power + b * AG_POINTS;
   Band_Enabled[b] == BAND_STATE_ENABLED ? (
-    this.band_set_meter(Band_Type[b], Band_Frequency[b], Band_Gain[b] * Scale / 100.0, band_q_eff(b, Band_Gain[b] * Scale / 100.0), Band_Slope[b]);
+    this.band_set_meter(Band_Type[b], Band_Frequency[b], Band_Gain[b] * Scale / 100.0 * MixK, band_q_eff(b, Band_Gain[b] * Scale / 100.0 * MixK), Band_Slope[b]);
 
     i = 0;
     loop(AG_POINTS,
@@ -2091,7 +2113,7 @@ function lp_fill_band(b, g) (
 // The gain a band in the engine is drawn at now: its static gain, plus its dynamic change unless it is
 // spectral (whose change is per bin), times Scale
 function lp_band_gain(b) (
-  (Band_Gain[b] + (LP_DynB[b] && !LP_Spec[b] ? Band_Dyn_Gain[b] : 0)) * Scale / 100;
+  (Band_Gain[b] + (LP_DynB[b] && !LP_Spec[b] ? Band_Dyn_Gain[b] : 0)) * Scale / 100 * MixK;
 );
 
 /*
@@ -2100,7 +2122,7 @@ function lp_band_gain(b) (
  */
 function lp_build() local(b, k, row, sp, sh, g, m, a, c, mm, x0, x1, sc) (
   lp_identity();
-  sc = Scale / 100;
+  sc = Scale / 100 * MixK;
   b = 0;
   loop(NUM_BANDS,
     LP_Band[b] ? (
@@ -2285,6 +2307,19 @@ function chr_tick(x, ch) local(h, d, i, acc0, acc1, y0, y1, p, out) (
     loop(CHR_TAPS, out += CHR_FIR[i] * d[i + 1]; i += 1);
     out;
   ) : chr_curve(x);
+);
+
+// ReEQ3: one sample of the output transformer (channel ch), at whatever rate it runs; the Neve's make-up
+// follows the two channels together, updated on the right channel's sample
+function tx_os(x, ch) local(y) (
+  Tx_Model == 1 ? (
+    y = ch == 0 ? tx0.tx_tick(x, Tx_DriveGain) : tx1.tx_tick(x, Tx_DriveGain);
+  ) : (
+    y = ch == 0 ? ne0.ne_tick(x, Tx_DriveGain) : ne1.ne_tick(x, Tx_DriveGain);
+    ch == 1 ? nemk.ne_makeup(ne0.pu + ne1.pu, ne0.pc + ne1.pc);
+    y *= nemk.gm;
+  );
+  y;
 );
 
 /*
@@ -2496,7 +2531,7 @@ function tb_learn_start(src) (
   TB_FA = 0;
   tb_stats_clear();
   memset(TB_SEG, 0, TB_PTS); TB_LSegN = 0; TB_LCPk = TB_LCMs = TB_LCN = 0;
-  TB_Learn = src;
+  TB_Learn = src; TB_StatsLive = 0;
   #TB_Name = src == 1 ? "Learned from input" : src == 2 ? "Learned from output" : "Learned from sidechain";
 );
 // The crest meter: the last 3 s or 10 s of half-second chunks, or everything since the reset
@@ -2934,7 +2969,7 @@ init_rate != srate ? (
   // Value stepper ids: the panel's dials, the dynamics grid in reading order, the toolbar's fields
   SV_FREQ = 0; SV_GAIN = 1; SV_Q = 2;
   SV_THRESH = 3; SV_RATIO = 4; SV_RANGE = 5; SV_ATTACK = 6; SV_RELEASE = 7;
-  SV_IN = 8; SV_SCALE = 9; SV_MID = 10; SV_SIDE = 11; SV_OUT = 12; SV_PAN = 13; SV_TX = 14;
+  SV_IN = 8; SV_SCALE = 9; SV_MID = 10; SV_SIDE = 11; SV_OUT = 12; SV_PAN = 13; SV_TX = 14; SV_MIX = 15;
 
   DB_EQ_RANGE = 18;
   DB_EQ_RANGE_STEPS = 6;
@@ -3186,13 +3221,27 @@ compact_width = 0;
   INST_ROWS = MEMORY.alloc_memory(GM_SLOTS);
   COLL = MEMORY.alloc_memory(PUB_PTS);
   // The LL/81 output transformer
+  // Oversampling for Character and the transformer: per path and channel, two up and two down stages
+  MEMORY.index = os_alloc(MEMORY.index);
+  ocu1L.os_bind(0, OS_F1, OS_T1); ocu1R.os_bind(1, OS_F1, OS_T1); ocu2L.os_bind(2, OS_F2, OS_T2); ocu2R.os_bind(3, OS_F2, OS_T2);
+  ocd2L.os_bind(4, OS_F2, OS_T2); ocd2R.os_bind(5, OS_F2, OS_T2); ocd1L.os_bind(6, OS_F1, OS_T1); ocd1R.os_bind(7, OS_F1, OS_T1);
+  otu1L.os_bind(8, OS_F1, OS_T1); otu1R.os_bind(9, OS_F1, OS_T1); otu2L.os_bind(10, OS_F2, OS_T2); otu2R.os_bind(11, OS_F2, OS_T2);
+  otd2L.os_bind(12, OS_F2, OS_T2); otd2R.os_bind(13, OS_F2, OS_T2); otd1L.os_bind(14, OS_F1, OS_T1); otd1R.os_bind(15, OS_F1, OS_T1);
+  // The dry signals the Mix blends these two stages with (delayed as they are), and the input Bypass plays
+  MX_N = 64; MX_CL = MEMORY.alloc_memory(MX_N); MX_CR = MEMORY.alloc_memory(MX_N); MX_TL = MEMORY.alloc_memory(MX_N); MX_TR = MEMORY.alloc_memory(MX_N);
+  memset(MX_CL, 0, MX_N); memset(MX_CR, 0, MX_N); memset(MX_TL, 0, MX_N); memset(MX_TR, 0, MX_N); MX_P = 0;
+  MEMORY.index = ceil(MEMORY.index / 65536) * 65536;
+  BP_N = 65536; BP_L = MEMORY.alloc_memory(BP_N); BP_R = MEMORY.alloc_memory(BP_N);
+  memset(BP_L, 0, BP_N); memset(BP_R, 0, BP_N); BP_POS = 0; bp_g = Bypass_Value ? 1 : 0;
+  bp_k = 1 / (0.02 * srate);
+  OS_Live = -1; MixK = min(max(Mix_Value, 0), 100) / 100;
   tx_setup(srate); ne_setup(srate); tx0.tx_reset(); tx1.tx_reset(); ne0.ne_reset(); ne1.ne_reset(); nemk.eu = nemk.ec = 0; nemk.gm = 1;
   // Luftikus mode
   MEMORY.index = lf_alloc(MEMORY.index);
   LF_LastKeep = -1; Lf_Live = 0;
   // Clarity
   MEMORY.index = cl_alloc(MEMORY.index);
-  cl_setup(srate); cl_control(); Cl_Live = 0; Cl_RLo = Cl_RHi = -1;
+  CL_SpeedLive = Cl_Speed; cl_setup(srate); cl_design(0); Cl_Live = 0; Cl_RLo = Cl_RHi = -1;
   // Tonal Balance
   MEMORY.index = tb_alloc(MEMORY.index);
   tb_setup(srate);
@@ -3242,7 +3291,7 @@ compact_width = 0;
   EQM_CAP = 15000000; memset(EQM_CAP, -120, PUB_PTS);
   EQM_Bands = 8; EQM_Amount = 100;
   Ext_Src = 0; Collisions_On = 1; Grab_On = 1;
-  Cl_Bias = Cl_Bright = Cl_Boost = Cl_SC = 0; Cl_Lo = 20; Cl_Hi = 20000;
+  Cl_Bias = Cl_Bright = Cl_Boost = Cl_SC = 0; Cl_Lo = 20; Cl_Hi = 20000; Cl_Speed = 1;
   TBT = 15010000; tb_factory(1, TBT); TB_Target = 1; #TB_Name = "Modern"; TB_Avg = 0; TB_View = 1; TB_MBands = 6;
   #Instance_Name = "";
 );
@@ -3293,6 +3342,12 @@ Scale != slider_last_scale ? (
   slider_last_scale = Scale;
   flag_filter_update_all();
 );
+// ReEQ3 Mix: it scales every band (and morphs those without gain), so it redraws them all too
+MixK = min(max(Mix_Value, 0), 100) / 100;
+MixK != mix_last ? (
+  mix_last = MixK;
+  mix_b = 0; loop(NUM_BANDS, flag_filter_update(mix_b); mix_b += 1);
+);
 
 // Update any automation
 sliders_to_filters();
@@ -3306,6 +3361,12 @@ update_state();
 file_avail(handle) >= 0 ? (
   // Read mode
   file_var(0, version);
+  // ReEQ3 3.7: sliders 9 and 10 are Mix and Bypass now; before state 123 they held the analyser's
+  // ceiling and floor, which move into the state
+  version < 123 ? (
+    Ceiling_Value = min(max(floor(Mix_Value + 0.5), 0), 2); Floor_Value = min(max(floor(Bypass_Value + 0.5), 0), 2);
+    Mix_Value = 100; Bypass_Value = 0; MixK = 1; bp_g = 0;
+  );
   // Files before 112 have no UI size: they follow the default
   UI_Size = 0;
 
@@ -3386,6 +3447,9 @@ file_avail(handle) >= 0 ? (
       EQM_ApN = 0;
       // Clarity, from 122
       version >= 122 ? cl_serialize();
+      // The analyser's ceiling and floor, and Clarity's speed, from 123
+      version >= 123 ? (file_var(0, Ceiling_Value); file_var(0, Floor_Value); file_var(0, Cl_Speed));
+      Cl_Speed = min(max(floor(Cl_Speed + 0.5), 0), 2);
     ) : (
       band = 0;
       loop(numBands,
@@ -3422,7 +3486,7 @@ file_avail(handle) >= 0 ? (
   // Write mode
   // The version number should reflect the ReEQ version when the file
   // format changed.
-  version = 122;
+  version = 123;
 
   file_var(0, version);
   file_var(0, NUM_BANDS);
@@ -3463,9 +3527,12 @@ file_avail(handle) >= 0 ? (
   file_var(0, AB_Cur); file_mem(0, AB_HAS, 2); file_mem(0, AB_MEM, 2 * AB_SZ);
   file_var(0, EQM_Amount);
   cl_serialize();
+  file_var(0, Ceiling_Value); file_var(0, Floor_Value); file_var(0, Cl_Speed);
 );
 
 flag_filter_update_all();
+MixK = min(max(Mix_Value, 0), 100) / 100; mix_last = -1;
+update_state();
 
 filters_to_sliders();
 
@@ -3583,8 +3650,9 @@ la_want != la_len ? (
 // The delay REAPER compensates: the lookahead, or the linear phase engine's latency
 // ReEQ3 Clarity: its range limits, a clean start, and its delay (half its analysis window)
 Cl_Lo != Cl_RLo || Cl_Hi != Cl_RHi ? (cl_range(Cl_Lo, Cl_Hi); Cl_RLo = Cl_Lo; Cl_RHi = Cl_Hi);
-Cl_On != Cl_Live ? (cl_reset(); cl_control(); Cl_Live = Cl_On);
-lp_pdc = la_len + (LP_On ? LP_LAT : 0) + (Character > 0 && Quality ? 15 : 0) + (Cl_On ? CL_D : 0);
+Cl_On != Cl_Live ? (cl_reset(); cl_design(0); Cl_Live = Cl_On);
+Cl_Speed != CL_SpeedLive ? cl_speed(Cl_Speed);
+lp_pdc = la_len + (LP_On ? LP_LAT : 0) + (Character > 0 ? OS_LAT : 0) + (Tx_Model > 0 ? OS_LAT : 0) + (Cl_On ? CL_D : 0);
 lp_pdc != pdc_delay ? (pdc_delay = lp_pdc; pdc_bot_ch = 0; pdc_top_ch = 2);
 // A start or stop mustn't replay what was in the line from before
 play_state != la_play ? (
@@ -3675,7 +3743,7 @@ Tx_Model != Tx_Live ? (tx0.tx_reset(); tx1.tx_reset(); ne0.ne_reset(); ne1.ne_re
 Tx_Live = Tx_Model;
 
 // ReEQ3 Luftikus mode: its parameters into the engine; switching it on starts its filters clean
-lf_block(srate, Lf_G10, Lf_G40, Lf_G160, Lf_G640, Lf_G2k5, Lf_Air, Lf_AirType, Lf_Keep, Lf_Analog, Lf_Mastering, Lf_Trim);
+lf_block(srate, Lf_G10 * MixK, Lf_G40 * MixK, Lf_G160 * MixK, Lf_G640 * MixK, Lf_G2k5 * MixK, Lf_Air * MixK, Lf_AirType, Lf_Keep, Lf_Analog, Lf_Mastering, Lf_Trim * MixK);
 Lf_On && !Lf_Live ? lf_reset();
 Lf_Live = Lf_On;
 
@@ -3687,6 +3755,16 @@ Out_PanOn = op_p != 0;
 // Character
 Character != chr_mode_live ? (chr_mode_live = Character; Character > 0 ? chr_set(Character); chr_init(); chr_dc0 = chr_dc1 = chr_dx0 = chr_dx1 = 0);
 CHR_HQ != Quality ? (CHR_HQ = Quality; chr_init());
+// ReEQ3 oversampling: the factor for Character and the transformer; the transformer is set up at its rate
+OS_Q = min(max(floor(Quality + 0.5), 0), 2);
+OS_Q != OS_Live ? (
+  OS_Live = OS_Q; OS_FAC = OS_Q == 0 ? 1 : OS_Q == 1 ? 2 : 4; OS_LAT = os_latency(OS_Q);
+  ocu1L.os_clear(); ocu1R.os_clear(); ocu2L.os_clear(); ocu2R.os_clear(); ocd2L.os_clear(); ocd2R.os_clear(); ocd1L.os_clear(); ocd1R.os_clear();
+  otu1L.os_clear(); otu1R.os_clear(); otu2L.os_clear(); otu2R.os_clear(); otd2L.os_clear(); otd2R.os_clear(); otd1L.os_clear(); otd1R.os_clear();
+  tx_setup(srate * OS_FAC); ne_setup(srate * OS_FAC);
+  tx0.tx_reset(); tx1.tx_reset(); ne0.ne_reset(); ne1.ne_reset();
+);
+Bypass_Value != bp_last ? (bp_last = Bypass_Value);
 chr_hp = 1 - exp(-2 * $pi * 5 / srate);
 
 @sample
@@ -3701,6 +3779,8 @@ function decodeMS(mid, side, l*, r*) (
   r = mid - side;
 );
 
+// ReEQ3 Bypass: the plugin's own input, before anything touches it
+bp_in0 = spl0; bp_in1 = spl1;
 spl0 += 0.0000000001; // DeNorm fix
 spl1 += 0.0000000001; // DeNorm fix
 
@@ -4086,36 +4166,40 @@ Lf_On && !Listen_Process ? (
   spl0 = lf_tick(spl0, 0); spl1 = lf_tick(spl1, 1);
 );
 
-// ReEQ3: Clarity, the adaptive unmasking equaliser: analysis rings, the delay, an analysis every CL_H
-// samples, the gains every 16, and its 31 bells in series on both channels
+// ReEQ3: Clarity, the adaptive unmasking equaliser: its analysis rings, then the linear-phase
+// overlap-add that applies its curve (CL_D samples late; the Mix scales the curve)
 Cl_On && !Listen_Process ? (
   CL_RL[CL_RP] = Cl_SC ? spl2 : spl0; CL_RR[CL_RP] = Cl_SC ? spl3 : spl1;
   Cl_SC ? (CL_ML[CL_RP] = spl0; CL_MR[CL_RP] = spl1);
   CL_RP = (CL_RP + 1) & (CL_N - 1);
-  cl_l = CL_DL[CL_DP]; cl_r = CL_DR[CL_DP]; CL_DL[CL_DP] = spl0; CL_DR[CL_DP] = spl1;
-  (CL_DP += 1) >= CL_D ? CL_DP = 0;
-  (CL_HC += 1) >= CL_H ? (CL_HC = 0; cl_analyse(Cl_Recover * 0.01, Cl_Tame * 0.01, Cl_Bias * 0.01, Cl_Bright * 0.01, Cl_Boost, Cl_SC));
-  (CL_CC += 1) >= 16 ? (CL_CC = 0; cl_control());
-  cl_bi = 0;
-  loop(CL_NA,
-    cl_v3 = cl_l - CL_I2L[cl_bi];
-    cl_v1 = CL_A1[cl_bi] * CL_I1L[cl_bi] + CL_A2[cl_bi] * cl_v3;
-    cl_v2 = CL_I2L[cl_bi] + CL_A2[cl_bi] * CL_I1L[cl_bi] + CL_A3[cl_bi] * cl_v3;
-    CL_I1L[cl_bi] = 2 * cl_v1 - CL_I1L[cl_bi]; CL_I2L[cl_bi] = 2 * cl_v2 - CL_I2L[cl_bi];
-    cl_l += CL_M1[cl_bi] * cl_v1;
-    cl_v3 = cl_r - CL_I2R[cl_bi];
-    cl_v1 = CL_A1[cl_bi] * CL_I1R[cl_bi] + CL_A2[cl_bi] * cl_v3;
-    cl_v2 = CL_I2R[cl_bi] + CL_A2[cl_bi] * CL_I1R[cl_bi] + CL_A3[cl_bi] * cl_v3;
-    CL_I1R[cl_bi] = 2 * cl_v1 - CL_I1R[cl_bi]; CL_I2R[cl_bi] = 2 * cl_v2 - CL_I2R[cl_bi];
-    cl_r += CL_M1[cl_bi] * cl_v1;
-    cl_bi += 1;
-  );
-  spl0 = cl_l * CL_CompLin; spl1 = cl_r * CL_CompLin;
+  cl_tick(spl0, spl1, Cl_Recover * 0.01, Cl_Tame * 0.01, Cl_Bias * 0.01, Cl_Bright * 0.01, Cl_Boost, Cl_SC, Mix_Value * 0.01);
+  spl0 = CL_OL; spl1 = CL_OR;
 );
 
 // ReEQ3: Character, on the equalised signal (its bias taken out by a 5Hz high pass)
+// (oversampled 2x or 4x when asked; below 100 % Mix, blended with its own input delayed as it is)
 Character > 0 && !Listen_Process ? (
-  spl0 = chr_tick(spl0, 0); spl1 = chr_tick(spl1, 1);
+  mx_a = spl0; mx_b = spl1;
+  OS_Q == 0 ? (
+    spl0 = chr_curve(spl0); spl1 = chr_curve(spl1);
+  ) : OS_Q == 1 ? (
+    ocu1L.os_up(spl0); ocu1R.os_up(spl1);
+    spl0 = ocd1L.os_down(chr_curve(ocu1L.y0), chr_curve(ocu1L.y1));
+    spl1 = ocd1R.os_down(chr_curve(ocu1R.y0), chr_curve(ocu1R.y1));
+  ) : (
+    ocu1L.os_up(spl0); ocu1R.os_up(spl1);
+    ocu2L.os_up(ocu1L.y0); os_a0 = chr_curve(ocu2L.y0); os_a1 = chr_curve(ocu2L.y1);
+    ocu2L.os_up(ocu1L.y1); os_a2 = chr_curve(ocu2L.y0); os_a3 = chr_curve(ocu2L.y1);
+    spl0 = ocd1L.os_down(ocd2L.os_down(os_a0, os_a1), ocd2L.os_down(os_a2, os_a3));
+    ocu2R.os_up(ocu1R.y0); os_a0 = chr_curve(ocu2R.y0); os_a1 = chr_curve(ocu2R.y1);
+    ocu2R.os_up(ocu1R.y1); os_a2 = chr_curve(ocu2R.y0); os_a3 = chr_curve(ocu2R.y1);
+    spl1 = ocd1R.os_down(ocd2R.os_down(os_a0, os_a1), ocd2R.os_down(os_a2, os_a3));
+  );
+  MX_CL[MX_P] = mx_a; MX_CR[MX_P] = mx_b;
+  MixK < 1 ? (
+    mx_i = (MX_P - OS_LAT) & (MX_N - 1);
+    spl0 = MX_CL[mx_i] + MixK * (spl0 - MX_CL[mx_i]); spl1 = MX_CR[mx_i] + MixK * (spl1 - MX_CR[mx_i]);
+  );
   chr_dc0 += chr_hp * (spl0 - chr_dc0); spl0 -= chr_dc0;
   chr_dc1 += chr_hp * (spl1 - chr_dc1); spl1 -= chr_dc1;
 );
@@ -4203,13 +4287,31 @@ Out_PanOn ? (
 );
 
 // ReEQ3: the BBC LL/81 MSC output transformer, last before the limiter
-Tx_Model == 1 ? (
-  spl0 = tx0.tx_tick(spl0, Tx_DriveGain); spl1 = tx1.tx_tick(spl1, Tx_DriveGain);
-) : Tx_Model == 2 ? (
-  spl0 = ne0.ne_tick(spl0, Tx_DriveGain); spl1 = ne1.ne_tick(spl1, Tx_DriveGain);
-  nemk.ne_makeup(ne0.pu + ne1.pu, ne0.pc + ne1.pc);
-  spl0 *= nemk.gm; spl1 *= nemk.gm;
+// (at 2x or 4x when asked; below 100 % Mix, blended with its own input delayed as it is)
+Tx_Model > 0 ? (
+  mx_a = spl0; mx_b = spl1;
+  OS_Q == 0 ? (
+    spl0 = tx_os(spl0, 0); spl1 = tx_os(spl1, 1);
+  ) : OS_Q == 1 ? (
+    otu1L.os_up(spl0); otu1R.os_up(spl1);
+    spl0 = otd1L.os_down(tx_os(otu1L.y0, 0), tx_os(otu1L.y1, 0));
+    spl1 = otd1R.os_down(tx_os(otu1R.y0, 1), tx_os(otu1R.y1, 1));
+  ) : (
+    otu1L.os_up(spl0); otu1R.os_up(spl1);
+    otu2L.os_up(otu1L.y0); os_a0 = tx_os(otu2L.y0, 0); os_a1 = tx_os(otu2L.y1, 0);
+    otu2L.os_up(otu1L.y1); os_a2 = tx_os(otu2L.y0, 0); os_a3 = tx_os(otu2L.y1, 0);
+    spl0 = otd1L.os_down(otd2L.os_down(os_a0, os_a1), otd2L.os_down(os_a2, os_a3));
+    otu2R.os_up(otu1R.y0); os_a0 = tx_os(otu2R.y0, 1); os_a1 = tx_os(otu2R.y1, 1);
+    otu2R.os_up(otu1R.y1); os_a2 = tx_os(otu2R.y0, 1); os_a3 = tx_os(otu2R.y1, 1);
+    spl1 = otd1R.os_down(otd2R.os_down(os_a0, os_a1), otd2R.os_down(os_a2, os_a3));
+  );
+  MX_TL[MX_P] = mx_a; MX_TR[MX_P] = mx_b;
+  MixK < 1 ? (
+    mx_i = (MX_P - OS_LAT) & (MX_N - 1);
+    spl0 = MX_TL[mx_i] + MixK * (spl0 - MX_TL[mx_i]); spl1 = MX_TR[mx_i] + MixK * (spl1 - MX_TR[mx_i]);
+  );
 );
+MX_P = (MX_P + 1) & (MX_N - 1);
 
 // Limit the output
 LimitOutput ? (
@@ -4253,6 +4355,15 @@ TB_Solo >= 0 ? (
   TB_Solo != 0 ? (spl0 = tsh0b.tb_tick(tsh0a.tb_tick(spl0)); spl1 = tsh1b.tb_tick(tsh1a.tb_tick(spl1)));
 );
 
+// ReEQ3 Bypass: the input, delayed as much as REAPER is told, crossfaded in over 20 ms (and out)
+BP_L[BP_POS] = bp_in0; BP_R[BP_POS] = bp_in1;
+bp_g += Bypass_Value ? min(bp_k, 1 - bp_g) : -min(bp_k, bp_g);
+bp_g > 0 ? (
+  bp_i = (BP_POS - pdc_delay) & (BP_N - 1);
+  spl0 += bp_g * (BP_L[bp_i] - spl0); spl1 += bp_g * (BP_R[bp_i] - spl1);
+);
+BP_POS = (BP_POS + 1) & (BP_N - 1);
+
 // Output peak for the meter, read and reset by @gfx
 out_pk0 = max(out_pk0, abs(spl0));
 out_pk1 = max(out_pk1, abs(spl1));
@@ -4270,7 +4381,7 @@ Scope_On ? (
 // ReEQ3 A/B level match: the output's power
 ab_out += spl0 * spl0 + spl1 * spl1; ab_n += 1;
 
-@gfx 1000 564
+@gfx 1120 564
 
 // Embedded in the track or mixer panel (gfx_ext_flags bit 1, REAPER 6.30+): curves, fills, nodes and the
 // analyser only, with no header, toolbar, panel, labels or hover card
@@ -4500,7 +4611,7 @@ function ui_help_c(l) (
 );
 function ui_help_d(l) (
     !strcmp(l, "CHARACTER") ? "Character\nA gentle asymmetric saturation after the\nEQ: Clean, Subtle or Warm." :
-    !strcmp(l, "OVERSAMPLE") ? "Oversample\nRuns the filters at twice the sample rate." :
+    !strcmp(l, "OVERSAMPLE") ? "Oversample\nRuns Character and the output transformer\nat 2 or 4 times the sample rate, so their\nharmonics don't fold back (aliasing)." :
     !strcmp(l, "REFERENCE") ? "EQ Match reference\nWhat to match to: the sidechain, another\ninstance (pick it with Match) or a capture\nof this input." :
     !strcmp(l, "BANDS") ? "EQ Match bands\nHow many bells the match may use." :
     !strcmp(l, "Rename") || !strcmp(l, "Done") ? "Rename\nGives this instance the name the others\nlist it by." :
@@ -6823,6 +6934,10 @@ function handle_number_button() instance (x, y, width, menutext, label, drag, he
       abs(db) < 0.005 ? db = 0;
       db = min(FIELD_DB_MAX, db);
       db = max(FIELD_DB_MIN, db);
+    ) : type == 4 ? (
+      // Mix, 0..100%
+      db -= md * 0.5;
+      db = min(max(floor(db * 2 + 0.5) / 2, 0), 100);
     ) : type == 3 ? (
       // transformer drive, 0..36dB
       db -= md * 0.075;
@@ -6926,6 +7041,7 @@ function sv_spec(id, b) (
   id == SV_RELEASE ? (sv_min = DYN_REL_MIN; sv_max = DYN_REL_MAX; sv_int = 4; sv_dec = 0; sv_def = 80; strcpy(#sv_lab, "Release"); strcpy(#sv_unit, "ms")) :
   id == SV_SCALE ? (sv_min = 0; sv_max = SCALE_MAX; sv_int = 3; sv_dec = 0; sv_def = 100; strcpy(#sv_lab, "Scale"); strcpy(#sv_unit, "%")) :
   id == SV_TX ? (sv_min = 0; sv_max = 36; sv_int = 2; sv_dec = 1; sv_def = 0; strcpy(#sv_lab, "Transformer Drive"); strcpy(#sv_unit, "dB")) :
+  id == SV_MIX ? (sv_min = 0; sv_max = 100; sv_int = 3; sv_dec = 0; sv_def = 100; strcpy(#sv_lab, "Mix"); strcpy(#sv_unit, "%")) :
   id == SV_PAN ? (sv_min = -100; sv_max = 100; sv_int = 3; sv_dec = 1; sv_def = 0; strcpy(#sv_lab, Out_PanMode ? "Mid / Side" : "Pan"); strcpy(#sv_unit, "%")) : (
     // The toolbar's dB fields
     sv_min = FIELD_DB_MIN; sv_max = FIELD_DB_MAX; sv_int = 3; sv_dec = 1;
@@ -6937,7 +7053,7 @@ function sv_get(id, b) (
   id == SV_FREQ ? Band_Frequency[b] : id == SV_GAIN ? Band_Gain[b] : id == SV_Q ? Band_Q[b] :
   id == SV_THRESH ? Band_Dyn_Thresh[b] : id == SV_RATIO ? Band_Dyn_Ratio[b] : id == SV_RANGE ? Band_Dynamic_Range[b] :
   id == SV_ATTACK ? Band_Dyn_Attack[b] : id == SV_RELEASE ? Band_Dyn_Release[b] :
-  id == SV_IN ? InGain : id == SV_SCALE ? Scale : id == SV_MID ? MLGain : id == SV_SIDE ? SRGain : id == SV_PAN ? Out_Pan : id == SV_TX ? Tx_Drive : Gain;
+  id == SV_IN ? InGain : id == SV_SCALE ? Scale : id == SV_MID ? MLGain : id == SV_SIDE ? SRGain : id == SV_PAN ? Out_Pan : id == SV_TX ? Tx_Drive : id == SV_MIX ? Mix_Value : Gain;
 );
 
 /*
@@ -6963,6 +7079,7 @@ function sv_put(id, b, v) (
   id == SV_SIDE ? (SRGain = v; slider_automate(SRGain)) :
   id == SV_PAN ? (Out_Pan = v; slider_automate(Out_Pan)) :
   id == SV_TX ? (Tx_Drive = v; slider_automate(Tx_Drive)) :
+  id == SV_MIX ? (Mix_Value = v; slider_automate(Mix_Value)) :
   (Gain = v; slider_automate(Gain));
 );
 
@@ -7030,6 +7147,7 @@ function sv_hit() local(b, c, r, id) (
     button_side_gain.is_mouse_number_button() ? id = SV_SIDE :
     button_pan.is_mouse_number_button() ? id = SV_PAN :
     button_tx.is_mouse_number_button() ? id = SV_TX :
+    button_mix.is_mouse_number_button() ? id = SV_MIX :
     button_gain.is_mouse_number_button() ? id = SV_OUT;
   );
   id >= 0 && !sv_live(id, b) ? -1 : id;
@@ -7095,9 +7213,9 @@ function sv_parse(str, id) local(n, i, c, num, frac, fdiv, sgn, have, k, note, a
       ui_parse_ok = 1;
       xr ? (
         // A gain ratio: only for the dB controls
-        v > 0 && (id == SV_GAIN || id == SV_RANGE || id == SV_THRESH || id >= SV_IN && id != SV_SCALE && id != SV_PAN) ?
+        v > 0 && (id == SV_GAIN || id == SV_RANGE || id == SV_THRESH || id >= SV_IN && id != SV_SCALE && id != SV_PAN && id != SV_MIX) ?
           v = 20 * log10(v) : ui_parse_ok = 0;
-      ) : pct && id != SV_PAN && id != SV_SCALE ? (
+      ) : pct && id != SV_PAN && id != SV_SCALE && id != SV_MIX ? (
         // A share of the control's travel, as its knob or dial maps it
         t0 = min(max(v / 100, 0), 1);
         sv_spec(id, ui_sv_b);
@@ -7131,6 +7249,7 @@ function sv_open(id) local(k) (
   id == SV_SIDE ? (ui_pop_x = button_side_gain.x; ui_pop_y = button_side_gain.y; ui_pop_w = button_side_gain.width) :
   id == SV_PAN ? (ui_pop_x = button_pan.x; ui_pop_y = button_pan.y; ui_pop_w = button_pan.width) :
   id == SV_TX ? (ui_pop_x = button_tx.x; ui_pop_y = button_tx.y; ui_pop_w = button_tx.width) :
+  id == SV_MIX ? (ui_pop_x = button_mix.x; ui_pop_y = button_mix.y; ui_pop_w = button_mix.width) :
   (ui_pop_x = button_gain.x; ui_pop_y = button_gain.y; ui_pop_w = button_gain.width);
   ui_popup = 9; ui_pop_skip = 1; ui_block = 1;
   // ReEQ3: typing starts afresh
@@ -7383,7 +7502,7 @@ function ui_fmt_pan(str, v) (
 
 function ui_draw_bar()
   local(s, y0, bh, h, y, d, labels, units, gap, mw, pol, w_in, w_lr, w_ms, w_sc, w_mid, w_side, w_lim, w_auto, w_pan, w_out,
-        wl, wc, wr, gg, pad, xl, xc, xr, x, nv, sc, inv, midv, sidev, outv, ag, can, k, w_proc, w_pn, prl, panv, w_tx, tv, kx, no_scale, tx_pol, tx_pol_keep)
+        wl, wc, wr, gg, pad, xl, xc, xr, x, nv, sc, inv, midv, sidev, outv, ag, can, k, w_proc, w_pn, prl, panv, w_tx, tv, kx, no_scale, tx_pol, tx_pol_keep, w_by, w_mx, w_dl)
 (
   s = ui_pt(1);
   bh = ui_pt(40); y0 = gfx_h - bh;
@@ -7424,6 +7543,10 @@ function ui_draw_bar()
     gfx_setfont(FONT_BODY);
     w_lim = ui_text_w("Limit") + ui_pt(18); w_pan = ui_text_w("Panel") + ui_pt(18);
     w_dl = ui_text_w("Delta") + ui_pt(18);
+    w_by = ui_text_w("Bypass") + ui_pt(18);
+    gfx_setfont(FONT_BODY_B); w_mx = ui_text_w("100%") + ui_pt(18);
+    gfx_setfont(FONT_CAP); w_mx += ui_text_w("MIX") + ui_pt(7);
+    gfx_setfont(FONT_BODY);
     // ReEQ3: Processing (the long text when there is room) and the output pan with its mode cell
     gfx_setfont(FONT_BODY_B);
     w_pn = max(ui_text_w("R100"), ui_text_w(panv)) + ui_pt(18) + pol;
@@ -7447,8 +7570,8 @@ function ui_draw_bar()
     // Input on the left; scale and the stereo controls (selector first) in the centre; output on the right
     wl = w_in;
     no_scale ? w_sc = -gap;
-    wc = w_sc + gap + w_lr + w_ms + gap + w_mid + gap + w_side;
-    wr = w_dl + gap + w_lim + gap + w_auto + gap + w_pan + gap + w_pn + gap + w_tx + gap + w_out;
+    wc = w_sc + gap + w_mx + gap + w_lr + w_ms + gap + w_mid + gap + w_side;
+    wr = w_by + gap + w_dl + gap + w_lim + gap + w_auto + gap + w_pan + gap + w_pn + gap + w_tx + gap + w_out;
     d += 1;
     d < 5 && wl + wc + wr + 2 * gg + 2 * pad > gfx_w;
   );
@@ -7486,6 +7609,17 @@ function ui_draw_bar()
   );
 
   x += w_sc + gap;
+  // ReEQ3 Mix: how much of the processing is applied, 0 to 100 % (the whole plugin, with no phase trouble)
+  button_mix.type = 4;
+  button_mix.x = x; button_mix.y = y; button_mix.width = w_mx; button_mix.height = h;
+  button_mix.db = Mix_Value;
+  can ? (
+    nv = button_mix.handle_number_button();
+    nv != Mix_Value ? sv_put(SV_MIX, -1, nv);
+  );
+  ui_help(x, y, w_mx, h, "Mix\nHow much of the processing is applied.\nThe bands, Luftikus and Clarity are scaled\n(so nothing combs or shifts in phase);\nCharacter and the transformer are blended\nwith their own, time-aligned input.");
+  ui_field(x, y, w_mx, h, "MIX", sprintf(#, "%d%%", Mix_Value), "", button_mix.drag || ui_hover(x, y, w_mx, h));
+  x += w_mx + gap;
   nv = ui_seg2(x, y, h, w_lr, w_ms, "L/R", "M/S", Stereo_Mode ? 0 : 1);
   nv != (Stereo_Mode ? 0 : 1) ? (
     Stereo_Mode = nv == 0 ? 1 : 0;
@@ -7522,6 +7656,11 @@ function ui_draw_bar()
 
   // Output: Limit, Auto (right-click to apply its make-up to Out), Panel, Out with a peak meter
   x = xr;
+  // ReEQ3 Bypass: the whole plugin, click-free and still delay-compensated
+  ui_help(x, y, w_by, h, "Bypass\nPlays the plugin's input instead of its\noutput, with a short crossfade and the\nsame latency, so the comparison is clean.");
+  ui_button(x, y, w_by, h, "Bypass", Bypass_Value ? 2 : 0) ? (Bypass_Value = !Bypass_Value; slider_automate(Bypass_Value));
+  Bypass_Value ? (ui_box(x, y, w_by, h, ui_pt(5), T_DANGER_FILL, 1, T_DANGER_BORDER); gfx_setfont(FONT_BODY_B); ui_col(T_DANGER); ui_text_c(x, y, w_by, h, "Bypass"));
+  x += w_by + gap;
   // ReEQ3 Delta: hear only what the EQ changes. Not saved, so it can't stay on by mistake.
   ui_help(x, y, w_dl, h, "Delta\nPlays only what the EQ changes: the\nequalised signal minus the input. Silence\nmeans the bands are doing nothing.");
   ui_button(x, y, w_dl, h, "Delta", Delta_On ? 1 : 0) ? Delta_On = !Delta_On;
@@ -9593,7 +9732,7 @@ function tb_load_file(path) local(h, i, v, ok) (
         i = 0;
         while (i < TB_TSIZE && file_avail(h) > 0) (v = 0; file_var(h, v); TB_TMP[i] = v; i += 1);
         i >= TB_TSIZE - 3 && TB_TMP[TB_OVALID] == 1 ? (
-          memcpy(TBT, TB_TMP, TB_TSIZE); strcpy(#TB_Name, #tb_l2); TB_Target = 0; TB_Ver += 1; ok = 1;
+          memcpy(TBT, TB_TMP, TB_TSIZE); strcpy(#TB_Name, #tb_l2); TB_Target = 0; TB_Ver += 1; ok = 1; TB_StatsLive = 0;
         );
       );
     );
@@ -9618,16 +9757,22 @@ function tb_lib_read() local(h) (
 
 function tb_set_factory(k) (
   tb_factory(k, TBT); TB_Target = k; TB_Learn = 0; TB_FA = 0; TB_Ver += 1;
-  #TB_Name = k == 1 ? "Modern" : k == 2 ? "Bass Heavy" : k == 3 ? "Acoustic / Orchestral" : "Pink noise";
+  TB_StatsLive = 0;
+  #TB_Name = k == 1 ? "Modern" : k == 2 ? "Bass Heavy" : k == 3 ? "Acoustic / Orchestral" : k == 4 ? "Pink noise" :
+    k == 5 ? "Pop" : k == 6 ? "Rock" : k == 7 ? "Electronic" : k == 8 ? "Hip-hop" : k == 9 ? "Jazz" : k == 10 ? "Folk" :
+    k == 11 ? "Disco" : k == 12 ? "RnB" : "Soul";
 );
 
 /*
- * Building a target from dropped audio files, a slice per frame (strings 900.. hold their paths):
+ * Building a target from dropped audio files (up to 512 at a time), a slice per frame (strings 100..
+ * hold their paths):
  * 3 s segments of 50%-overlapped transforms, the low end's crest per segment
  */
 function tb_fa_start() (
   TB_Learn = 0;
-  tb_stats_clear();
+  // Adding to the target these statistics made: they go on; otherwise a fresh start
+  TB_Add && TB_StatsLive && TB_Target == 0 ? (TB_FA_Base = TB_FA_Total) : (tb_stats_clear(); TB_FA_Base = 0; strcpy(#TB_First, 100));
+  TB_StatsLive = 0;
   TB_FA = 1; TB_FA_I = 0; TB_FA_H = -1; TB_FA_Files = 0; TB_FA_Bad = 0;
 );
 function tb_fa_seg() local(i, cr) (
@@ -9651,13 +9796,14 @@ function tb_fa_step() local(ch, sr, n, i, x, y, t0) (
       TB_FA_I >= TB_FA_N ? (
         // Done: the statistics become the target
         TB_FA = 0;
-        tb_stats_write(TBT, TB_FA_Files, TB_SMG) ? (
-          tb_fa_name(#TB_Name, 900);
-          TB_FA_Files > 1 ? strcat(#TB_Name, sprintf(#, " +%d", TB_FA_Files - 1));
-          TB_Target = 0; TB_Ver += 1; TB_Msg = 0;
+        TB_FA_Total = TB_FA_Base + TB_FA_Files;
+        tb_stats_write(TBT, TB_FA_Total, TB_SMG) ? (
+          tb_fa_name(#TB_Name, #TB_First);
+          TB_FA_Total > 1 ? strcat(#TB_Name, sprintf(#, " +%d", TB_FA_Total - 1));
+          TB_Target = 0; TB_Ver += 1; TB_Msg = 0; TB_StatsLive = 1;
         ) : TB_Msg = 1;
       ) : (
-        TB_FA_H = file_open(900 + TB_FA_I);
+        TB_FA_H = file_open(100 + TB_FA_I);
         ch = sr = 0;
         TB_FA_H >= 0 ? file_riff(TB_FA_H, ch, sr);
         TB_FA_H >= 0 && ch >= 1 && sr >= 8000 ? (
@@ -9709,8 +9855,8 @@ function tb_drop() local(k, n, e) (
     e = strlen(#tb_dp);
     e > 4 && !stricmp(strcpy_substr(#tb_de, #tb_dp, e - 4, 4), ".txt") ? (
       tb_load_file(#tb_dp) ? (TB_Learn = 0; TB_FA = 0) : TB_Msg = 2;
-    ) : n < 32 ? (
-      strcpy(900 + n, #tb_dp); n += 1;
+    ) : n < 512 ? (
+      strcpy(100 + n, #tb_dp); n += 1;
     );
     k += 1;
   );
@@ -9722,30 +9868,36 @@ function tb_drop() local(k, n, e) (
 );
 
 // The target menu
-function tb_menu() local(k, i, nlib) (
+function tb_menu() local(k, i, nlib, base) (
   nlib = tb_lib_read();
-  #tb_m = sprintf(#, "%sModern|%sBass Heavy|%sAcoustic / Orchestral|%sPink noise||>Library",
+  #tb_m = sprintf(#, "%sModern|%sBass Heavy|%sAcoustic / Orchestral|%sPink noise|>Styles (after Pestana et al., AES 2013)",
     TB_Target == 1 ? "!" : "", TB_Target == 2 ? "!" : "", TB_Target == 3 ? "!" : "", TB_Target == 4 ? "!" : "");
+  strcat(#tb_m, sprintf(#, "|%sPop|%sRock|%sElectronic|%sHip-hop|%sJazz", TB_Target == 5 ? "!" : "", TB_Target == 6 ? "!" : "",
+    TB_Target == 7 ? "!" : "", TB_Target == 8 ? "!" : "", TB_Target == 9 ? "!" : ""));
+  strcat(#tb_m, sprintf(#, "|%sFolk|%sDisco|%sRnB|<%sSoul||>Library", TB_Target == 10 ? "!" : "", TB_Target == 11 ? "!" : "",
+    TB_Target == 12 ? "!" : "", TB_Target == 13 ? "!" : ""));
   nlib == 0 ? strcat(#tb_m, "|<#(empty: save one with the action ReEQ3 Save Tonal Target)") : (
     i = 0;
     loop(nlib, strcat(#tb_m, i == nlib - 1 ? "|<" : "|"); strcat(#tb_m, 960 + i); i += 1);
   );
   strcat(#tb_m, sprintf(#, "||%sLearn from this input (while playing)|%sLearn from the output|%sLearn from the sidechain (pins 3/4)",
     TB_Learn == 1 ? "!" : "", TB_Learn == 2 ? "!" : "", TB_Learn == 3 ? "!" : ""));
-  strcat(#tb_m, "||#Drop audio files on the window to build a target from them");
+  strcat(#tb_m, sprintf(#, "||%sDropped files add to the target they made (instead of starting a new one)", TB_Add ? "!" : ""));
+  strcat(#tb_m, "|#Drop audio files on the window (up to 512 at a time) to build a target from them");
   gfx_x = ui_tb_mx; gfx_y = ui_tb_my;
   k = gfx_showmenu(#tb_m);
-  // Items: 4 factory, the library (or its one placeholder), 3 learn, the hint
-  k >= 1 && k <= 4 ? tb_set_factory(k) :
-  k > 4 && k <= 4 + max(nlib, 1) ? (
+  // Items: 4 general shapes, 9 styles, the library (or its one placeholder), 3 learn, add, the hint
+  base = 13 + max(nlib, 1);
+  k >= 1 && k <= 13 ? tb_set_factory(k) :
+  k > 13 && k <= base ? (
     nlib > 0 ? (
-      #tb_lp = "ReEQ3/Targets/"; strcat(#tb_lp, 960 + k - 5); strcat(#tb_lp, ".txt");
+      #tb_lp = "ReEQ3/Targets/"; strcat(#tb_lp, 960 + k - 14); strcat(#tb_lp, ".txt");
       tb_load_file(#tb_lp) ? (TB_Learn = 0; TB_FA = 0) : TB_Msg = 2;
     );
-  ) : k > 4 + max(nlib, 1) && k <= 7 + max(nlib, 1) ? (
-    k -= 4 + max(nlib, 1);
+  ) : k > base && k <= base + 3 ? (
+    k -= base;
     TB_Learn == k ? TB_Learn = 0 : tb_learn_start(k);
-  );
+  ) : k == base + 4 ? TB_Add = !TB_Add;
 );
 
 // For the Save Tonal Target action: this target, its name and this instance's tag, while the panel shows
@@ -10062,6 +10214,7 @@ function ui_draw_tb_panel() local(s, x, y, w, h, hy, hh, bx, bw, k, i, cx, cw, b
     sprintf(#tb_st, "Learning · %d segments (%d s) · click the target to stop", TBT[TB_OSEG] * TBT[TB_OVALID], 3 * TBT[TB_OSEG] * TBT[TB_OVALID]);
   ) : TB_Msg == 1 ? strcpy(#tb_st, "Nothing usable in those files (silent, or not audio)") :
       TB_Msg == 2 ? strcpy(#tb_st, "That isn't a ReEQ3 tonal target file") :
+      TB_Target >= 5 ? strcpy(#tb_st, "Style: slope from Pestana et al. 2013 (772 no. 1 singles)") :
       TB_Target > 0 ? strcpy(#tb_st, "Factory shape: drawn up, not measured") :
       TBT[TB_OFILES] > 0 ? sprintf(#tb_st, "From %d file%s · %d segments", TBT[TB_OFILES], TBT[TB_OFILES] > 1 ? "s" : "", TBT[TB_OSEG]) :
       sprintf(#tb_st, "%d segments", TBT[TB_OSEG]);
@@ -10150,7 +10303,11 @@ function ui_draw_cl_panel() local(s, x, y, w, h, hy, hh, bx, bw, sp, cx, cy, v, 
   gfx_setfont(FONT_BODY_B); bw = ui_text_w("Off") + 22 * s;
   ui_button(bx, hy, bw, hh, Cl_On ? "On" : "Off", Cl_On ? 1 : 0) ? (Cl_On = !Cl_On; slider_automate(Cl_On));
   gfx_setfont(FONT_CAP); ui_col(T_TEXT_DIM);
-  ui_text_l(bx + bw + 10 * s, hy, hh, sprintf(#, "adaptive unmasking · %d ms latency · drag the limits on the graph", floor(1000 * CL_D / srate + 0.5)));
+  bx += bw + 10 * s;
+  ui_help(bx, hy, 190 * s, hh, "Speed\nHow fast the curve follows the music:\nSlow is the most transparent, Fast the\nmost detailed.");
+  v = ui_segn(bx, hy, 190 * s, hh, 3, Cl_Speed, ui_press && ui_free(), "Slow", "Medium", "Fast", "", "");
+  v >= 0 ? Cl_Speed = v;
+  ui_text_l(bx + 200 * s, hy, hh, sprintf(#, "linear phase · %d ms · drag the limits on the graph", floor(1000 * CL_D / srate + 0.5)));
   ui_icon_button(x + w - 10 * s - 26 * s, hy, 26 * s, hh, 10, 0) ? ui_cl_show = 0;
   gfx_setfont(FONT_BODY); bw = ui_text_w("Sidechain") + 18 * s; tx = x + w - 10 * s - 26 * s - 8 * s - bw;
   ui_button(tx, hy, bw, hh, "Sidechain", Cl_SC ? 1 : 0) ? Cl_SC = !Cl_SC;
@@ -10238,7 +10395,7 @@ function ui_draw_proc_pop() local(s, pad, pw, ph, px, py, x, y, w, pr, skip, k, 
   px = floor(max(4 * s, min(ui_bar_px, gfx_w - pw - 4 * s)));
   py = ui_pop_frame(px, pw, ph);
   inpop = ui_in(px, py, pw, ph);
-  lat = (LP_On ? LP_LAT : la_len) + (Character > 0 && Quality ? 15 : 0);
+  lat = pdc_delay;
   ui_pop_head(px, py, pw, "Processing", lat > 0 ? sprintf(#, "Latency %.1f ms", 1000 * lat / srate) : "No latency");
 
   x = px + pad; w = pw - 2 * pad; y = py + 30 * s + 10 * s;
@@ -10251,7 +10408,7 @@ function ui_draw_proc_pop() local(s, pad, pw, ph, px, py, x, y, w, pr, skip, k, 
   k = ui_prow(x, y, w, "CHARACTER", 3, Character, pr, "Clean", "Subtle", "Warm", "", "");
   k >= 0 && k != Character ? (Character = k; slider_automate(Character));
   y += 22 * s + 8 * s;
-  k = ui_prow(x, y, w, "OVERSAMPLE", 2, Quality ? 1 : 0, pr, "Off", "2x", "", "", "");
+  k = ui_prow(x, y, w, "OVERSAMPLE", 3, min(max(floor(Quality + 0.5), 0), 2), pr, "Off", "2x", "4x", "", "");
   k >= 0 && k != Quality ? (Quality = k; slider_automate(Quality));
   y += 22 * s + 8 * s;
   ui_col(T_BORDER_SUBTLE); gfx_line(x, y, x + w, y, 0);
@@ -10259,7 +10416,7 @@ function ui_draw_proc_pop() local(s, pad, pw, ph, px, py, x, y, w, pr, skip, k, 
   gfx_setfont(FONT_CAP); ui_col(T_TEXT_DIM);
   ui_text_l(x, y, 14 * s, "Linear Phase: no phase shift, at the resolution's latency.");
   ui_text_l(x, y + 14 * s, 14 * s, "Spectral bands always run at that resolution.");
-  ui_text_l(x, y + 28 * s, 14 * s, "Character: analogue-style saturation (2x adds 15 samples).");
+  ui_text_l(x, y + 28 * s, 14 * s, "Oversampling: Character and the transformer (31 or 37 samples each).");
 
   ui_top_pop_close(px, py, pw, ph, pr, skip);
   gfx_setfont(FONT_BASE);
